@@ -4,15 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "speck-reflex"
-version = "0.1.0"
-description = "Independent reproduction of SynSense Speck 2f software baselines"
+version = "0.2.0"
+description = "Robot Neuromorphic Reflex Arc Co-design Platform"
 requires-python = ">=3.10"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+packages = [
+  "speck_reflex",
+  "speck_reflex.official_baseline",
+  "speck_reflex.protocol",
+  "speck_reflex.robot",
+  "speck_reflex.runtime",
+  "software",
+  "software.event_processing",
+  "software.models",
+  "software.simulation",
+  "hardware",
+  "hardware.interfaces",
+]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools.package-dir]
+speck_reflex = "src/speck_reflex"
+software = "software"
+hardware = "hardware"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

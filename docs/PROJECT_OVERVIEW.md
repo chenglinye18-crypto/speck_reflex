@@ -1,12 +1,22 @@
 # Project overview
 
-This independent project has four deliberately separated layers:
+The repository is a robot neuromorphic reflex arc co-design platform, not an SNN-only or vendor-SDK project. Its primary artifacts are stable cross-layer contracts, reproducible benchmarks, and evidence connecting algorithms to timing, power, hardware limits, communication, and Safety MCU behavior.
 
-| Layer | Current state | Depends on |
+| Layer | Current state | Next evidence |
 |---|---|---|
-| Software model | Official random smoke and official-weight N-MNIST functional demo complete | Tonic, Torch, Sinabs |
-| Offline deployment/simulation | DynapCNN config and Specksim complete | Sinabs backend, Samna |
-| Physical hardware | Not started | Speck 2f, approved USB access, routing/readout validation |
-| Robot reflex | Requirements/types only; no model or transport | Hardware evidence, robot data, STM32 contract |
+| Event/model software contracts | Implemented and unit-tested | Real robot event-window adapters and reference risk models |
+| Simulation and official baseline | Sinabs N-MNIST software/configuration/Specksim retained | Adapt a robot task without coupling it to Speck APIs |
+| Communication protocols | v1 event/reflex semantics and risk frame documented | Golden binary vectors, fuzz/error tests and transport selection |
+| STM32N6 | Architecture placeholder only | Board/toolchain selection and deterministic protocol prototype |
+| FPGA | Design plan only | Fixed-point specification and block-level golden vectors |
+| Neuromorphic hardware | Speck no-hardware baseline only | Physical sensor/routing/readout/power evidence |
+| Robot system | Requirements only | Measured dataset, controlled rig and MCU-safe integration |
 
-“Host-injected” means recorded 34×34 N-MNIST events enter the deployment/simulator path from the host. “On-chip DVS” means the Speck 2f internal 128×128 sensor is routed on chip; that path is not validated. “Smoke” means structural execution with random weights, not task performance. “Functional demo” means licensed trained weights with actual output and measured test-subset accuracy.
+Terms:
+
+- **Event:** canonical `x, y, timestamp_us, polarity` record.
+- **Event window:** ordered events plus explicit sensor geometry and time boundary.
+- **Reflex prediction:** backend-neutral risk, TTC, direction, emergency-stop request, and timestamp.
+- **Backend:** simulation or hardware implementation behind a common lifecycle/data-plane contract.
+- **Safety MCU:** independent final deterministic arbiter; model outputs remain advisory.
+- **Host-injected baseline:** host supplies recorded events; it is not an internal sensor path.

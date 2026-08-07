@@ -6,6 +6,12 @@ __pycache__/
 .ipynb_checkpoints/
 data/raw/
 data/official/
+datasets/**/raw/
+datasets/**/downloads/
+hardware/**/build/
+hardware/**/*.bit
+hardware/**/*.xsa
+hardware/**/*.elf
 models/checkpoints/
 experiments/official_baselines/nmnist/checkpoints/*.pt
 logs/*.log

@@ -11,7 +11,7 @@ fi
 # shellcheck disable=SC1091
 source "$PROJECT_DIR/.venv/bin/activate"
 
-echo "Speck Reflex environment activated"
+echo "Robot Neuromorphic Reflex Platform environment activated"
 echo "Project: ${PROJECT_DIR/#$HOME/~}"
 echo "Python: $(python --version)"
 echo "CUDA_HOME: ${CUDA_HOME:-unset}"

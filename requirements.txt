@@ -1,0 +1,3 @@
+# Convenience entry point for direct, non-PyTorch dependencies.
+# Install the documented PyTorch CUDA/CPU build separately first.
+-r requirements/core.txt
