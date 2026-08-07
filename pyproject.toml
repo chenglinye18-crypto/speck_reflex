@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speck-reflex"
+version = "0.1.0"
+description = "Independent reproduction of SynSense Speck 2f software baselines"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers"
+markers = [
+  "unit: isolated tests without network, GPU, or hardware",
+  "integration: no-hardware software deployment-chain tests",
+  "gpu: tests requiring CUDA",
+  "hardware: opt-in physical-device tests",
+  "slow: long-running tests or training",
+]

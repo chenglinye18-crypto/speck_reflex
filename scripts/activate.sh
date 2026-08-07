@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="$HOME/projects/speck_reflex"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$PROJECT_DIR"
+if [[ ! -f "$PROJECT_DIR/.venv/bin/activate" ]]; then
+  echo "Missing .venv. Run scripts/bootstrap_wsl_cuda.sh for checks, then --install if needed." >&2
+  return 1 2>/dev/null || exit 1
+fi
+# shellcheck disable=SC1091
 source "$PROJECT_DIR/.venv/bin/activate"
 
 echo "Speck Reflex environment activated"
-echo "Project: $PROJECT_DIR"
+echo "Project: ${PROJECT_DIR/#$HOME/~}"
 echo "Python: $(python --version)"
 echo "CUDA_HOME: ${CUDA_HOME:-unset}"
 

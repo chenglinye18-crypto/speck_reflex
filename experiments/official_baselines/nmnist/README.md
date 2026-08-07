@@ -1,18 +1,5 @@
-# Official N-MNIST no-hardware baseline
+# N-MNIST official baselines
 
-This workspace ports only the no-hardware sections of the official Sinabs 3.1.3 examples:
+`run_official_nmnist_no_hardware.py` is the random-weight deployment smoke test. `evaluate_nmnist_baseline.py` is the functional demo using the NIR checkpoint shipped in the pinned Sinabs v3.1.3 submodule. `train_nmnist_baseline.py` is a fallback reproducer for the quick-start BPTT topology; it is not needed to run the licensed upstream checkpoint.
 
-- `third_party/synsense/sinabs/docs/speck/notebooks/nmnist_quick_start.ipynb`
-- `third_party/synsense/sinabs/docs/speck/specksim.md`
-- `third_party/synsense/sinabs/docs/speck/faqs/save_hardware_config_as_binary.md`
-
-Run from the repository root:
-
-```bash
-MPLCONFIGDIR=/tmp/speck-reflex-mpl \
-  .venv/bin/python experiments/official_baselines/nmnist/run_official_nmnist_no_hardware.py \
-  2>&1 | tee logs/official_baselines/nmnist_no_hardware.log
-```
-
-The script downloads only the official N-MNIST test split through Tonic. It does not enumerate or
-open devices, launch the visualizer, call `DynapcnnNetwork.to(...)`, or write flash.
+All paths use host-injected 34×34 N-MNIST events. No script discovers, opens, or writes a physical device. Flash binary generation is disabled by default and is available only in the smoke runner with explicit board-specific CLI arguments.

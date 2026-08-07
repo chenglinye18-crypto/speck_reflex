@@ -1,0 +1,20 @@
+seed: 17
+data_root: data/official/NMNIST
+model:
+  source: sinabs_v3.1.3_nir_to_speck
+  input_shape: [2, 34, 34]
+  time_window_us: 1000
+training_fallback:
+  epochs: 10
+  batch_size: 4
+  learning_rate: 0.001
+  optimizer: sgd
+  validation_fraction: 0.1
+  resume: null
+evaluation:
+  sample_index: 0
+  accuracy_samples: 50
+deployment:
+  device_type: speck2fmodule
+  dvs_input: false
+  generate_flash_binary: false

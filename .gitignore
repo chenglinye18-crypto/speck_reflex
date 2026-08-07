@@ -7,10 +7,13 @@ __pycache__/
 data/raw/
 data/official/
 models/checkpoints/
+experiments/official_baselines/nmnist/checkpoints/*.pt
 logs/*.log
 logs/**/*.log
+logs/refactor/
 wheels/
 .DS_Store
 .vscode/settings.json
 tests/cuda_smoke_test
 experiments/official_baselines/nmnist/artifacts/*.bin
+experiments/official_baselines/nmnist/artifacts/*.tmp
