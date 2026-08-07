@@ -1,0 +1,106 @@
+{
+  "seed": 17,
+  "versions": {
+    "python": "3.10.12",
+    "torch": "2.10.0+cu128",
+    "sinabs": "3.1.3",
+    "samna": "0.48.6.0",
+    "tonic": "1.6.0"
+  },
+  "source": "Sinabs v3.1.3 N-MNIST quick-start BPTT architecture",
+  "sample": {
+    "split": "test",
+    "index": 0,
+    "label": 0,
+    "raw_event_count": 5293,
+    "raster_shape": [
+      100,
+      2,
+      34,
+      34
+    ]
+  },
+  "sinabs_software": {
+    "passed": true,
+    "output_shape": [
+      100,
+      10
+    ],
+    "spike_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "dynapcnn": {
+    "construction_passed": true,
+    "software_forward_passed": true,
+    "compatible_with_speck2fdevkit": true,
+    "layer2core_map": {
+      "0": 0,
+      "1": 1,
+      "2": 2,
+      "3": 3
+    },
+    "output_shape": [
+      100,
+      10,
+      1,
+      1
+    ],
+    "spike_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "samna_config": {
+    "generated": true,
+    "type": "samna.speck2f.configuration.SpeckConfiguration",
+    "valid": true,
+    "validation_message": ""
+  },
+  "specksim": {
+    "passed": true,
+    "input_event_count": 5293,
+    "output_event_count": 0,
+    "spike_counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "flash_binary": {
+    "generated": true,
+    "path": "experiments/official_baselines/nmnist/artifacts/nmnist_speck2f_config.bin",
+    "bytes": 362496,
+    "flash_write_called": false
+  },
+  "hardware": {
+    "connected": false,
+    "device_discovery_called": false,
+    "device_open_called": false,
+    "dynapcnn_to_hardware_called": false
+  }
+}

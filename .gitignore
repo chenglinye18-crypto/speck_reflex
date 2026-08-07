@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+data/raw/
+data/official/
+models/checkpoints/
+logs/*.log
+logs/**/*.log
+wheels/
+.DS_Store
+.vscode/settings.json
+tests/cuda_smoke_test
+experiments/official_baselines/nmnist/artifacts/*.bin

@@ -1,0 +1,12 @@
+[submodule "third_party/synsense/synsense_model_example"]
+	path = third_party/synsense/synsense_model_example
+	url = https://gitlab.com/synsense/synsense_model_example.git
+[submodule "third_party/synsense/dvs_tool"]
+	path = third_party/synsense/dvs_tool
+	url = https://gitlab.com/synsense/dvs_tool.git
+[submodule "third_party/synsense/docker_speck2f"]
+	path = third_party/synsense/docker_speck2f
+	url = https://gitlab.com/synsense/docker_speck2f.git
+[submodule "third_party/synsense/sinabs"]
+	path = third_party/synsense/sinabs
+	url = https://github.com/synsense/sinabs.git

@@ -1,0 +1,72 @@
+Speck Reflex Environment Information
+Generated: 2026-08-06T19:08:58+08:00
+
+User and paths
+- User: speck
+- Project path: /home/speck/projects/speck_reflex
+- Virtual environment: /home/speck/projects/speck_reflex/.venv
+- Virtual environment size: 8.1 GiB
+
+Operating system
+- Ubuntu: Ubuntu 22.04.5 LTS (Jammy Jellyfish)
+- WSL kernel: 6.18.33.2-microsoft-standard-WSL2
+- Platform: Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.35
+
+Python environment
+- Python: 3.10.12
+- pip: 26.2.1
+- Python executable: /home/speck/projects/speck_reflex/.venv/bin/python
+- pip check: No broken requirements found.
+
+GPU and CUDA
+- GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+- GPU memory reported by nvidia-smi: 8188 MiB
+- GPU memory reported by PyTorch: 8.00 GiB
+- Compute capability: 8.9
+- Windows NVIDIA driver visible in WSL: 577.02
+- nvidia-smi CUDA compatibility maximum: 12.9
+- CUDA Toolkit package: cuda-toolkit-12-8 12.8.2-1
+- CUDA Toolkit path: /usr/local/cuda-12.8
+- nvcc: release 12.8, V12.8.93
+- CUDA_HOME: /usr/local/cuda-12.8
+
+PyTorch
+- torch: 2.10.0+cu128
+- torchvision: 0.25.0+cu128
+- torchaudio: 2.10.0+cu128
+- torch.version.cuda: 12.8
+- torch.cuda.is_available(): True
+- torch.cuda.device_count(): 1
+- 4096x4096 CUDA matrix test: PYTORCH_CUDA_TEST_PASSED
+- Measured matrix multiplication elapsed time: 0.021470154999406077 seconds
+
+SynSense software
+- Sinabs distribution/runtime: 3.1.3 / 3.1.3
+- Samna distribution/runtime: 0.48.6 / 0.48.6.0
+- Samna platform wheel: CPython 3.10 manylinux_2_28 x86_64
+- DynapcnnNetwork import: PASSED
+- get_device_map(): {}
+- SynSense import test: SYNSENSE_IMPORT_TEST_PASSED
+- Speck 2f board connected: no
+- Empty device map is expected until the confirmed board is attached.
+
+Tests
+- CUDA C++ smoke test: CUDA_NVCC_SMOKE_TEST_PASSED
+- PyTorch CUDA matrix test: PYTORCH_CUDA_TEST_PASSED
+- pytest: 5 passed in 1.73s
+- pip check: No broken requirements found.
+
+Jupyter
+- Kernel name: speck-reflex
+- Display name: Python (Speck Reflex)
+- Kernel path: /home/speck/.local/share/jupyter/kernels/speck-reflex
+- Kernel interpreter: /home/speck/projects/speck_reflex/.venv/bin/python
+
+Notes
+- Tonic 1.6.0 selected NumPy 1.26.4 due to its numpy<2 requirement.
+- The first Samna import replaced its small bootstrap package with the matching
+  samna 0.48.6 CPython 3.10 manylinux platform wheel.
+- sinabs-dynapcnn and sinabs-exodus are not installed.
+- No USB device was bound or attached during setup.
+- Physical Speck 2f hardware operation under WSL remains to be validated after
+  positively identifying and attaching the board.
