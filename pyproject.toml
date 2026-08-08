@@ -16,6 +16,7 @@ packages = [
   "speck_reflex.robot",
   "speck_reflex.runtime",
   "software",
+  "software.datasets",
   "software.event_processing",
   "software.models",
   "software.models.snn",

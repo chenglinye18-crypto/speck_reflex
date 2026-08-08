@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Callable
 
 import torch
 from torch import Tensor, nn
@@ -21,6 +23,51 @@ class SNNMotionOutput:
     local_logits: Tensor
     global_embedding: Tensor
     ego_motion: Tensor | None
+
+
+@dataclass(frozen=True, slots=True)
+class LayerSpikeStatistics:
+    """Incrementally accumulated activity for one spiking layer."""
+
+    total_spikes: int
+    spikes_per_timestep: float
+    spikes_per_neuron_per_timestep: float
+    fast_spikes: int
+    slow_spikes: int
+
+
+@dataclass(frozen=True, slots=True)
+class SNNMotionStatistics:
+    """Architecture-level spike counts; no task performance is implied."""
+
+    layers: dict[str, LayerSpikeStatistics]
+
+
+@dataclass(slots=True)
+class SNNMotionRun:
+    """Normal model output accompanied by transient instrumentation results."""
+
+    output: SNNMotionOutput
+    statistics: SNNMotionStatistics
+
+
+@dataclass(slots=True)
+class _SpikeAccumulator:
+    total_spikes: int = 0
+    neuron_updates: int = 0
+    fast_spikes: int = 0
+    slow_spikes: int = 0
+
+    def update(self, spikes: Tensor, fast_channels: int) -> None:
+        detached = spikes.detach()
+        self.total_spikes += int(torch.count_nonzero(detached).item())
+        self.neuron_updates += detached.numel()
+        self.fast_spikes += int(
+            torch.count_nonzero(detached[:, :fast_channels]).item()
+        )
+        self.slow_spikes += int(
+            torch.count_nonzero(detached[:, fast_channels:]).item()
+        )
 
 
 class SNNMotionBackbone(nn.Module):
@@ -62,6 +109,7 @@ class SNNMotionBackbone(nn.Module):
             if self.config.enable_ego_head
             else None
         )
+        self.fold_layer_gains(self.config.layer_gains)
 
     def _make_block(
         self,
@@ -133,6 +181,55 @@ class SNNMotionBackbone(nn.Module):
             if isinstance(neuron, LIF):
                 neuron.reset_state()
 
+    def forward_with_stats(self, event_bins: Tensor) -> SNNMotionRun:
+        """Run normal forward while incrementally counting layer spikes.
+
+        Temporary hooks retain only scalar counters and are removed before this
+        method returns. The normal ``forward`` output and topology are unchanged.
+        """
+
+        layer_names = tuple(f"S{index}" for index in range(1, 7)) + ("primitive",)
+        blocks = tuple(self.stages) + (self.primitive_bottleneck,)
+        accumulators = {name: _SpikeAccumulator() for name in layer_names}
+        handles: list[torch.utils.hooks.RemovableHandle] = []
+
+        def make_hook(
+            name: str, fast_channels: int
+        ) -> Callable[[nn.Module, tuple[Tensor, ...], Tensor], None]:
+            def hook(_module: nn.Module, _inputs: tuple[Tensor, ...], output: Tensor) -> None:
+                accumulators[name].update(output, fast_channels)
+
+            return hook
+
+        try:
+            for name, block in zip(layer_names, blocks, strict=True):
+                handles.append(
+                    block.register_forward_hook(
+                        make_hook(name, block.neurons.fast_channels)
+                    )
+                )
+            output = self.forward(event_bins)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        timesteps = event_bins.shape[1]
+        statistics = {
+            name: LayerSpikeStatistics(
+                total_spikes=accumulator.total_spikes,
+                spikes_per_timestep=accumulator.total_spikes / timesteps,
+                spikes_per_neuron_per_timestep=(
+                    accumulator.total_spikes / accumulator.neuron_updates
+                    if accumulator.neuron_updates
+                    else 0.0
+                ),
+                fast_spikes=accumulator.fast_spikes,
+                slow_spikes=accumulator.slow_spikes,
+            )
+            for name, accumulator in accumulators.items()
+        }
+        return SNNMotionRun(output, SNNMotionStatistics(statistics))
+
     def detach_state(self) -> None:
         """Preserve membrane values while cutting the truncated-BPTT graph."""
 
@@ -151,3 +248,29 @@ class SNNMotionBackbone(nn.Module):
 
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
+
+    def synaptic_convolutions(self) -> tuple[nn.Conv2d, ...]:
+        """Return S1--S6 and primitive convolutions in frozen topology order."""
+
+        return tuple(stage.conv for stage in self.stages) + (
+            self.primitive_bottleneck.conv,
+        )
+
+    def fold_layer_gains(self, gains: tuple[float, ...]) -> None:
+        """Multiply static gains into weights without adding forward operations."""
+
+        convolutions = self.synaptic_convolutions()
+        if len(gains) != len(convolutions):
+            raise ValueError(f"expected {len(convolutions)} gains, got {len(gains)}")
+        with torch.no_grad():
+            for convolution, gain in zip(convolutions, gains, strict=True):
+                if gain <= 0.0 or not math.isfinite(gain):
+                    raise ValueError("all layer gains must be positive and finite")
+                convolution.weight.mul_(gain)
+
+    def forward_with_diagnostics(self, event_bins: Tensor):
+        """Run sampled membrane/current diagnostics without changing ``forward``."""
+
+        from .diagnostics import collect_snn_diagnostics
+
+        return collect_snn_diagnostics(self, event_bins)

@@ -19,6 +19,8 @@ class SNNMotionConfig:
     fast_ratio: float = 0.5
     enable_ego_head: bool = True
     surrogate: str = "atan"
+    initialization: str = "pytorch_default_kaiming_uniform_a_sqrt5"
+    layer_gains: tuple[float, ...] = (2.0, 4.0, 4.0, 4.0, 4.0, 4.0, 2.0)
 
     def __post_init__(self) -> None:
         if self.input_channels <= 0:
@@ -37,3 +39,7 @@ class SNNMotionConfig:
             raise ValueError("fast_ratio must lie strictly between 0 and 1")
         if self.surrogate != "atan":
             raise ValueError("SNN Motion Backbone v0.1 supports only the 'atan' surrogate")
+        if self.initialization != "pytorch_default_kaiming_uniform_a_sqrt5":
+            raise ValueError("unsupported initialization")
+        if len(self.layer_gains) != 7 or any(gain <= 0.0 for gain in self.layer_gains):
+            raise ValueError("layer_gains must contain seven positive values")
