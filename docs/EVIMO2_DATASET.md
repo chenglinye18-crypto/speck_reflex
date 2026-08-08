@@ -225,18 +225,19 @@ global_embedding: [B,T,64]
 ego_motion:       [B,T, 6] or None
 ```
 
-Planned supervision mapping:
+The frozen first-stage supervision mapping is:
 
 ```text
 adapter ego_motion [B,6]
-→ initially supervise a defined window endpoint/readout timestep
+→ supervise the temporal mean of the shared global readout [B,6]
 
 future independent-motion mask
 → supervise local_logits
 ```
 
-The temporal supervision policy is not yet frozen and no accuracy claim is
-made.
+The complete 64 ms Samsung Structure-from-Motion baseline contract is frozen
+in [EVIMO2_EGO_MOTION_BASELINE.md](EVIMO2_EGO_MOTION_BASELINE.md). Its training
+implementation has not started and no accuracy claim is made.
 
 ## Verified example
 
@@ -286,6 +287,8 @@ Before training:
 
 1. Build deterministic sequence-level train/validation/test indices.
 2. Audit event density and ego-motion target distributions across SFM splits.
-3. Freeze coordinate, normalization, and temporal supervision policies.
+3. Implement the frozen coordinate, normalization, state, and temporal
+   supervision policies in
+   [EVIMO2_EGO_MOTION_BASELINE.md](EVIMO2_EGO_MOTION_BASELINE.md).
 4. Train and report camera ego-motion without calling it robot-base odometry.
 5. Only then derive and audit independent-object-motion labels.
