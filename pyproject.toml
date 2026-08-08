@@ -18,6 +18,7 @@ packages = [
   "software",
   "software.event_processing",
   "software.models",
+  "software.models.snn",
   "software.simulation",
   "hardware",
   "hardware.interfaces",
@@ -30,7 +31,7 @@ hardware = "hardware"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = "--strict-markers"
 markers = [
   "unit: isolated tests without network, GPU, or hardware",
