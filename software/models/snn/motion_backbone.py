@@ -76,6 +76,10 @@ class SNNMotionBackbone(nn.Module):
     _KERNELS = (5, 3, 3, 5, 5, 3)
     _STRIDES = (2, 1, 2, 1, 1, 1)
     _PADDINGS = (2, 1, 1, 2, 2, 1)
+    # COMPATIBILITY_PATCH: torch 2.10.0+cu128 / CUDA 12.8 / RTX 4060 Laptop,
+    # seed 20260814. This shape-specific schedule preserves the frozen B=1 Conv
+    # results bitwise while still batching safe stages.
+    _EXACT_TEMPORAL_BATCH_SIZES = (64, 8, 64, 32, 32, 64, 1)
 
     def __init__(
         self,
@@ -86,6 +90,7 @@ class SNNMotionBackbone(nn.Module):
         compiled_lif_mode: str = "none",
         first_step_specialization: bool = False,
         lif_step_primitive: str = "mul_add",
+        execution_mode: str = "time_major",
     ) -> None:
         super().__init__()
         self.config = config or SNNMotionConfig()
@@ -96,6 +101,11 @@ class SNNMotionBackbone(nn.Module):
         self.compiled_lif_mode = compiled_lif_mode
         self.first_step_specialization = first_step_specialization
         self.lif_step_primitive = lif_step_primitive
+        if execution_mode not in {"time_major", "stage_major", "stage_major_chunked"}:
+            raise ValueError(
+                "execution_mode must be 'time_major', 'stage_major', or 'stage_major_chunked'"
+            )
+        self.execution_mode = execution_mode
 
         stage_inputs = (self.config.input_channels, *self.config.channels[:-1])
         self.stages = nn.ModuleList(
@@ -169,6 +179,19 @@ class SNNMotionBackbone(nn.Module):
         if not event_bins.is_floating_point():
             raise TypeError("event_bins must be a floating-point count or occupancy tensor")
 
+        if self.execution_mode in {"stage_major", "stage_major_chunked"}:
+            if torch.is_grad_enabled():
+                raise RuntimeError(
+                    "stage_major execution is inference-only; use torch.inference_mode()"
+                )
+            if event_bins.device.type != "cuda":
+                raise RuntimeError("stage_major execution is CUDA-only")
+            return self._forward_stage_major(event_bins)
+        return self._forward_time_major(event_bins)
+
+    def _forward_time_major(self, event_bins: Tensor) -> SNNMotionOutput:
+        """Trusted reference schedule: complete all stages one timestep at a time."""
+
         primitive_steps: list[Tensor] = []
         local_steps: list[Tensor] = []
         embedding_steps: list[Tensor] = []
@@ -190,6 +213,38 @@ class SNNMotionBackbone(nn.Module):
 
         return SNNMotionOutput(
             primitive_spikes=torch.stack(primitive_steps, dim=1),
+            local_logits=torch.stack(local_steps, dim=1),
+            global_embedding=torch.stack(embedding_steps, dim=1),
+            ego_motion=torch.stack(ego_steps, dim=1) if ego_steps is not None else None,
+        )
+
+    def _forward_stage_major(self, event_bins: Tensor) -> SNNMotionOutput:
+        """Batch each stateless Conv over time while preserving sequential LIF state."""
+
+        spikes = event_bins
+        blocks = (*self.stages, self.primitive_bottleneck)
+        chunk_sizes = (
+            self._EXACT_TEMPORAL_BATCH_SIZES
+            if self.execution_mode == "stage_major_chunked"
+            else (None,) * len(blocks)
+        )
+        for block, chunk_size in zip(blocks, chunk_sizes, strict=True):
+            spikes = block.forward_sequence(spikes, temporal_batch_size=chunk_size)
+        primitives = spikes
+
+        local_steps: list[Tensor] = []
+        embedding_steps: list[Tensor] = []
+        ego_steps: list[Tensor] | None = [] if self.ego_motion_head is not None else None
+        for time_index in range(event_bins.shape[1]):
+            primitive = primitives[:, time_index]
+            local_steps.append(self.local_motion_head(primitive))
+            embedding = F.adaptive_avg_pool2d(primitive, output_size=(2, 2)).flatten(1)
+            embedding_steps.append(embedding)
+            if ego_steps is not None and self.ego_motion_head is not None:
+                ego_steps.append(self.ego_motion_head(embedding))
+
+        return SNNMotionOutput(
+            primitive_spikes=primitives,
             local_logits=torch.stack(local_steps, dim=1),
             global_embedding=torch.stack(embedding_steps, dim=1),
             ego_motion=torch.stack(ego_steps, dim=1) if ego_steps is not None else None,
@@ -225,7 +280,7 @@ class SNNMotionBackbone(nn.Module):
         try:
             for name, block in zip(layer_names, blocks, strict=True):
                 handles.append(
-                    block.register_forward_hook(
+                    block.neurons.register_forward_hook(
                         make_hook(name, block.neurons.fast_channels)
                     )
                 )

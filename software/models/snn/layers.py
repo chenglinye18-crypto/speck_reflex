@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor, nn
 
 from .neurons import FusedMultiTimescaleLIF, MultiTimescaleLIF
@@ -62,6 +63,34 @@ class ConvLIFBlock(nn.Module):
 
     def forward(self, spikes: Tensor) -> Tensor:
         return self.neurons(self.conv(spikes))
+
+    def forward_sequence(
+        self, spikes: Tensor, *, temporal_batch_size: int | None = None
+    ) -> Tensor:
+        """Batch only this stage's stateless Conv over time, then scan its LIF."""
+
+        if spikes.ndim != 5:
+            raise ValueError("ConvLIFBlock.forward_sequence expects [B, T, C, H, W]")
+        batch, timesteps, channels, height, width = spikes.shape
+        chunk = timesteps if temporal_batch_size is None else temporal_batch_size
+        if chunk < 1:
+            raise ValueError("temporal_batch_size must be positive")
+        spike_steps: list[Tensor] = []
+        for start in range(0, timesteps, chunk):
+            temporal_chunk = spikes[:, start : start + chunk]
+            chunk_timesteps = temporal_chunk.shape[1]
+            merged = temporal_chunk.reshape(
+                batch * chunk_timesteps, channels, height, width
+            )
+            currents = self.conv(merged)
+            current_sequence = currents.reshape(
+                batch, chunk_timesteps, *currents.shape[1:]
+            )
+            spike_steps.extend(
+                self.neurons(current_sequence[:, index])
+                for index in range(chunk_timesteps)
+            )
+        return torch.stack(spike_steps, dim=1)
 
     def reset_state(self) -> None:
         self.neurons.reset_state()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CUDA runtime comparison for reference and fused SNNMotionBackbone LIFs.
+"""CUDA runtime comparison for SNNMotionBackbone execution schedules.
 
 This is a measurement-only tool.  It does not change the model topology,
 weights, or neuron equations.  The per-stage path mirrors ``forward`` in this
@@ -135,6 +135,53 @@ def normal_forward_samples(
     return samples
 
 
+def equivalence_summary(
+    reference: SNNMotionBackbone,
+    candidate: SNNMotionBackbone,
+    event_bins: Tensor,
+    device: torch.device,
+) -> None:
+    """Print exact checkpoint-level output and final-state comparisons."""
+
+    reference.reset_state()
+    candidate.reset_state()
+    with torch.inference_mode():
+        expected = reference(event_bins)
+        actual = candidate(event_bins)
+    torch.cuda.synchronize(device)
+    print(f"\nEquivalence: {candidate.execution_mode} vs time_major")
+    for name in ("primitive_spikes", "local_logits", "global_embedding", "ego_motion"):
+        expected_tensor = getattr(expected, name)
+        actual_tensor = getattr(actual, name)
+        if expected_tensor is None or actual_tensor is None:
+            print(f"{name}: exact={expected_tensor is actual_tensor}")
+            continue
+        difference = (expected_tensor - actual_tensor).abs()
+        mismatch = int(torch.count_nonzero(difference).item())
+        differing = torch.nonzero(difference, as_tuple=False)
+        first = differing[0].tolist() if mismatch else None
+        print(
+            f"{name}: exact={torch.equal(expected_tensor, actual_tensor)} "
+            f"max_abs={difference.max().item():.9g} "
+            f"mean_abs={difference.mean().item():.9g} mismatch={mismatch} "
+            f"first_index={first}"
+        )
+    for name, expected_state, actual_state in zip(
+        STAGE_NAMES,
+        reference.membrane_states(),
+        candidate.membrane_states(),
+        strict=True,
+    ):
+        difference = (expected_state - actual_state).abs()
+        print(
+            f"state {name}: exact={torch.equal(expected_state, actual_state)} "
+            f"max_abs={difference.max().item():.9g} "
+            f"mismatch={int(torch.count_nonzero(difference).item())}"
+        )
+    reference.reset_state()
+    candidate.reset_state()
+
+
 def diagnostic_stage_once(model: torch.nn.Module, event_bins: Tensor, device: torch.device) -> dict[str, float]:
     """Run forward-equivalent operations with events at every existing boundary."""
 
@@ -248,15 +295,22 @@ def profiler_summary(
     print(f"CUDA kernel/activity events: {cuda_events}")
     print(
         "op calls: "
+        f"conv2d={op_counts.get('aten::conv2d', 0)} "
+        f"cudnn_convolution={op_counts.get('aten::cudnn_convolution', 0)} "
         f"cat={op_counts.get('aten::cat', 0)} "
         f"split={op_counts.get('aten::split_with_sizes', 0) + op_counts.get('aten::split', 0)} "
         f"mul={op_counts.get('aten::mul', 0)} add={op_counts.get('aten::add', 0)} "
         f"sub={op_counts.get('aten::sub', 0)} ge={op_counts.get('aten::ge', 0)} "
-        f"copy_={op_counts.get('aten::copy_', 0)}"
+        f"copy_={op_counts.get('aten::copy_', 0)} "
+        f"clone={op_counts.get('aten::clone', 0)} "
+        f"contiguous={op_counts.get('aten::contiguous', 0)} "
+        f"reshape={op_counts.get('aten::reshape', 0)}"
     )
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
     return {
         "cuda_activities": cuda_events,
+        "conv2d": op_counts.get("aten::conv2d", 0),
+        "cudnn_convolution": op_counts.get("aten::cudnn_convolution", 0),
         "cat": op_counts.get("aten::cat", 0),
         "split": op_counts.get("aten::split_with_sizes", 0) + op_counts.get("aten::split", 0),
         "mul": op_counts.get("aten::mul", 0),
@@ -264,6 +318,9 @@ def profiler_summary(
         "sub": op_counts.get("aten::sub", 0),
         "ge": op_counts.get("aten::ge", 0),
         "copy_": op_counts.get("aten::copy_", 0),
+        "clone": op_counts.get("aten::clone", 0),
+        "contiguous": op_counts.get("aten::contiguous", 0),
+        "reshape": op_counts.get("aten::reshape", 0),
     }
 
 
@@ -294,6 +351,7 @@ def make_variant(
     compiled_lif_mode: str = "none",
     first_step_specialization: bool = False,
     lif_step_primitive: str = "mul_add",
+    execution_mode: str = "time_major",
     device: torch.device,
 ) -> SNNMotionBackbone:
     """Build a runtime-only variant from exactly the loaded checkpoint state."""
@@ -305,10 +363,116 @@ def make_variant(
         compiled_lif_mode=compiled_lif_mode,
         first_step_specialization=first_step_specialization,
         lif_step_primitive=lif_step_primitive,
+        execution_mode=execution_mode,
     ).to(device)
     variant.load_state_dict(reference.state_dict(), strict=True)
     variant.eval()
     return variant
+
+
+def temporal_stage_profile(
+    model: SNNMotionBackbone,
+    event_bins: Tensor,
+    device: torch.device,
+    *,
+    stage_major: bool,
+) -> tuple[dict[str, float], dict[str, bool]]:
+    """Measure stage Conv and sequential LIF scan without per-stage synchronizations."""
+
+    blocks = (*model.stages, model.primitive_bottleneck)
+    names = ("S1", "S2", "S3", "S4", "S5", "S6", "primitive")
+    events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+    layout: dict[str, bool] = {}
+    spikes = event_bins
+    model.reset_state()
+    with torch.inference_mode():
+        if stage_major:
+            chunk_sizes = (
+                model._EXACT_TEMPORAL_BATCH_SIZES
+                if model.execution_mode == "stage_major_chunked"
+                else (event_bins.shape[1],) * len(blocks)
+            )
+            for name, block, configured_chunk in zip(
+                names, blocks, chunk_sizes, strict=True
+            ):
+                layout[name] = spikes.is_contiguous()
+                batch, timesteps, channels, height, width = spikes.shape
+                conv_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+                lif_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+                spike_steps: list[Tensor] = []
+                chunk = min(configured_chunk, timesteps)
+                for start in range(0, timesteps, chunk):
+                    temporal_chunk = spikes[:, start : start + chunk]
+                    chunk_timesteps = temporal_chunk.shape[1]
+                    conv_start, conv_end = torch.cuda.Event(True), torch.cuda.Event(True)
+                    conv_start.record()
+                    merged = temporal_chunk.reshape(
+                        batch * chunk_timesteps, channels, height, width
+                    )
+                    currents = block.conv(merged)
+                    conv_end.record()
+                    conv_pairs.append((conv_start, conv_end))
+                    current_sequence = currents.reshape(
+                        batch, chunk_timesteps, *currents.shape[1:]
+                    )
+                    lif_start, lif_end = torch.cuda.Event(True), torch.cuda.Event(True)
+                    lif_start.record()
+                    spike_steps.extend(
+                        block.neurons(current_sequence[:, index])
+                        for index in range(chunk_timesteps)
+                    )
+                    lif_end.record()
+                    lif_pairs.append((lif_start, lif_end))
+                spikes = torch.stack(spike_steps, 1)
+                events[name + ":conv"] = conv_pairs  # type: ignore[assignment]
+                events[name + ":lif"] = lif_pairs  # type: ignore[assignment]
+        else:
+            stage_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
+            output_steps: list[list[Tensor]] = [[] for _ in blocks]
+            for time_index in range(event_bins.shape[1]):
+                current_spikes = event_bins[:, time_index]
+                for block_index, (name, block) in enumerate(zip(names, blocks, strict=True)):
+                    conv_start, conv_end = torch.cuda.Event(True), torch.cuda.Event(True)
+                    conv_start.record()
+                    currents = block.conv(current_spikes)
+                    conv_end.record()
+                    lif_start, lif_end = torch.cuda.Event(True), torch.cuda.Event(True)
+                    lif_start.record()
+                    current_spikes = block.neurons(currents)
+                    lif_end.record()
+                    stage_events[name + ":conv"].append((conv_start, conv_end))
+                    stage_events[name + ":lif"].append((lif_start, lif_end))
+                    output_steps[block_index].append(current_spikes)
+            for key, pairs in stage_events.items():
+                # Keep individual pairs; elapsed values are summed after synchronization.
+                events[key] = pairs  # type: ignore[assignment]
+    torch.cuda.synchronize(device)
+    elapsed: dict[str, float] = {}
+    for key, value in events.items():
+        if isinstance(value, list):
+            elapsed[key] = sum(start.elapsed_time(end) for start, end in value)
+        else:
+            elapsed[key] = value[0].elapsed_time(value[1])
+    model.reset_state()
+    return elapsed, layout
+
+
+def peak_forward_memory_mb(
+    model: SNNMotionBackbone, event_bins: Tensor, device: torch.device
+) -> tuple[float, float]:
+    """Return absolute and incremental allocated-memory peaks for one forward."""
+
+    model.reset_state()
+    torch.cuda.synchronize(device)
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    with torch.inference_mode():
+        output = model(event_bins)
+    torch.cuda.synchronize(device)
+    peak = torch.cuda.max_memory_allocated(device)
+    del output
+    model.reset_state()
+    return peak / 2**20, (peak - baseline) / 2**20
 
 
 def main() -> None:
@@ -322,44 +486,24 @@ def main() -> None:
     loaded = LiveEgoMotionModel.load(args.checkpoint, device=args.device)
     reference = loaded.model
     variants = {
-        "R0 reference": reference,
-        "R1 reference + fast spike": make_variant(
-            reference, lif_implementation="reference", inference_fast_spike=True, device=device
-        ),
-        "R2 fused": make_variant(
-            reference, lif_implementation="fused", inference_fast_spike=False, device=device
-        ),
-        "R3 fused + fast spike": make_variant(
-            reference, lif_implementation="fused", inference_fast_spike=True, device=device
-        ),
-        "R4a compiled default": make_variant(
+        "R3 time-major": make_variant(
             reference,
             lif_implementation="fused",
             inference_fast_spike=True,
-            compiled_lif_mode="default",
             device=device,
         ),
-        "R4b compiled reduce-overhead": make_variant(
+        "O2 stage-major": make_variant(
             reference,
             lif_implementation="fused",
             inference_fast_spike=True,
-            compiled_lif_mode="reduce-overhead",
+            execution_mode="stage_major",
             device=device,
         ),
-        "R5 R4a + first step": make_variant(
+        "O2 exact chunked": make_variant(
             reference,
             lif_implementation="fused",
             inference_fast_spike=True,
-            compiled_lif_mode="default",
-            first_step_specialization=True,
-            device=device,
-        ),
-        "R7 R4a + addcmul": make_variant(
-            reference,
-            lif_implementation="fused",
-            inference_fast_spike=True,
-            compiled_lif_mode="default",
-            lif_step_primitive="addcmul",
+            execution_mode="stage_major_chunked",
             device=device,
         ),
     }
@@ -372,53 +516,81 @@ def main() -> None:
 
     cpu_input = make_cpu_input(64)
     gpu_input = cpu_input.to(device)
+    equivalence_summary(
+        variants["R3 time-major"], variants["O2 stage-major"], gpu_input, device
+    )
+    equivalence_summary(
+        variants["R3 time-major"], variants["O2 exact chunked"], gpu_input, device
+    )
     variant_results: dict[str, dict[str, float]] = {}
-    print("\nPerformance (normal forward; CUDA events)")
+    print("\nO2 Performance (normal forward; CUDA events)")
     print(
         f"{'Variant':<28} {'p50 ms':>10} {'p95 ms':>10} {'mean ms':>10} "
         f"{'min ms':>10} {'max ms':>10} {'speedup':>10}"
     )
-    compile_timings: dict[str, float] = {}
-    rejected_variants: dict[str, str] = {}
     for label, model in variants.items():
-        try:
-            if label.startswith("R4") or label.startswith("R5") or label.startswith("R7"):
-                torch._dynamo.reset()
-                model.reset_state()
-                started = time.perf_counter()
-                with torch.inference_mode():
-                    model(gpu_input)
-                torch.cuda.synchronize(device)
-                compile_timings[label] = time.perf_counter() - started
-            warmup(model, gpu_input, args.warmup, device)
-            samples = normal_forward_samples(model, gpu_input, device, args.runs)
-            variant_results[label] = summarize(samples)
-        except RuntimeError as error:
-            rejected_variants[label] = str(error).splitlines()[0]
-            torch.cuda.synchronize(device)
-    baseline_p50 = variant_results["R0 reference"]["p50"]
+        warmup(model, gpu_input, args.warmup, device)
+        samples = normal_forward_samples(model, gpu_input, device, args.runs)
+        variant_results[label] = summarize(samples)
+    baseline_p50 = variant_results["R3 time-major"]["p50"]
     for label, summary in variant_results.items():
         print(
             f"{label:<28} {summary['p50']:10.3f} {summary['p95']:10.3f} "
             f"{summary['mean']:10.3f} {summary['min']:10.3f} {summary['max']:10.3f} "
             f"{baseline_p50 / summary['p50']:9.3f}x"
         )
-    for label, reason in rejected_variants.items():
-        print(f"{label:<28} REJECTED: {reason}")
-    for label, elapsed_s in compile_timings.items():
-        print(f"{label} first_compile_plus_forward_s={elapsed_s:.3f}")
-
-    optimized = variants["R3 fused + fast spike"]
-    print("\nT Scaling: R3 fused + fast spike (fixed B=1,C=2,H=96,W=128)")
-    print(f"{'T':>4} {'forward p50 ms':>16} {'forward p95 ms':>16} {'ms/timestep p50':>18}")
+    print("\nT Scaling (fixed B=1,C=2,H=96,W=128)")
+    print(f"{'Variant':<16} {'T':>4} {'p50 ms':>12} {'p95 ms':>12} {'ms/timestep':>14}")
     for timesteps in (1, 8, 32, 64):
         event_bins = make_cpu_input(timesteps).to(device)
-        warmup(optimized, event_bins, args.warmup, device)
-        samples = normal_forward_samples(optimized, event_bins, device, args.runs)
-        summary = summarize(samples)
-        print(f"{timesteps:4d} {summary['p50']:16.3f} {summary['p95']:16.3f} {summary['p50'] / timesteps:18.3f}")
-    profiler_summary("R3 fused + fast spike", optimized, gpu_input, device, args.profiler_runs)
-    profiler_summary("R4a compiled default", variants["R4a compiled default"], gpu_input, device, args.profiler_runs)
+        for label, model in variants.items():
+            warmup(model, event_bins, args.warmup, device)
+            summary = summarize(normal_forward_samples(model, event_bins, device, args.runs))
+            print(
+                f"{label:<16} {timesteps:4d} {summary['p50']:12.3f} "
+                f"{summary['p95']:12.3f} {summary['p50'] / timesteps:14.3f}"
+            )
+
+    diagnostic_runs = min(20, args.runs)
+    print(f"\nPer-Stage Runtime ({diagnostic_runs} instrumented diagnostic runs, p50)")
+    print(
+        f"{'Stage':<12} {'R3 conv':>10} {'R3 LIF':>10} {'O2 conv':>10} "
+        f"{'O2 LIF':>10} {'total speedup':>14}"
+    )
+    r3_profiles: dict[str, list[float]] = defaultdict(list)
+    o2_profiles: dict[str, list[float]] = defaultdict(list)
+    layout: dict[str, bool] = {}
+    for _ in range(diagnostic_runs):
+        r3_sample, _ = temporal_stage_profile(
+            variants["R3 time-major"], gpu_input, device, stage_major=False
+        )
+        o2_sample, layout = temporal_stage_profile(
+            variants["O2 exact chunked"], gpu_input, device, stage_major=True
+        )
+        for key, value in r3_sample.items():
+            r3_profiles[key].append(value)
+        for key, value in o2_sample.items():
+            o2_profiles[key].append(value)
+    for name in ("S1", "S2", "S3", "S4", "S5", "S6", "primitive"):
+        r3_conv = summarize(r3_profiles[name + ":conv"])["p50"]
+        r3_lif = summarize(r3_profiles[name + ":lif"])["p50"]
+        o2_conv = summarize(o2_profiles[name + ":conv"])["p50"]
+        o2_lif = summarize(o2_profiles[name + ":lif"])["p50"]
+        print(
+            f"{name:<12} {r3_conv:10.3f} {r3_lif:10.3f} "
+            f"{o2_conv:10.3f} {o2_lif:10.3f} "
+            f"{(r3_conv + r3_lif) / (o2_conv + o2_lif):14.3f}x"
+        )
+    print("stage-major input contiguity: " + " ".join(f"{key}={value}" for key, value in layout.items()))
+
+    for label, model in variants.items():
+        absolute, incremental = peak_forward_memory_mb(model, gpu_input, device)
+        print(f"Memory {label}: absolute_peak_mb={absolute:.3f} incremental_forward_mb={incremental:.3f}")
+    profiler_summary("R3 time-major", variants["R3 time-major"], gpu_input, device, args.profiler_runs)
+    profiler_summary("O2 stage-major", variants["O2 stage-major"], gpu_input, device, args.profiler_runs)
+    profiler_summary(
+        "O2 exact chunked", variants["O2 exact chunked"], gpu_input, device, args.profiler_runs
+    )
 
 
 if __name__ == "__main__":
