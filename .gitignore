@@ -13,6 +13,7 @@ hardware/**/*.bit
 hardware/**/*.xsa
 hardware/**/*.elf
 models/checkpoints/
+outputs/
 experiments/official_baselines/nmnist/checkpoints/*.pt
 logs/*.log
 logs/**/*.log

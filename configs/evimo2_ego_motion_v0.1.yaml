@@ -1,0 +1,37 @@
+seed: 17
+output_dir: outputs/evimo2_ego_motion_v0.1
+
+data:
+  root: ~/datasets/evimo2/structure_from_motion/samsung_mono
+  timesteps: 64
+  dt_ms: 1.0
+  spatial_reduction: 5
+  frame_stride: 4
+  validation_fraction: 0.15
+
+activity_audit:
+  windows: 8
+  warning_firing_fraction: 0.10
+  failure_firing_fraction: 0.25
+
+model:
+  initialization: pytorch_default_kaiming_uniform_a_sqrt5
+  # Measured-data profile calibrated with seed 17 on deterministic Samsung SFM
+  # windows. Gains are folded into weights; no runtime normalization is added.
+  layer_gains: [0.75, 2.5, 3.0, 3.0, 3.0, 3.0, 2.0]
+
+training:
+  epochs: 20
+  # Same effective batch size as the original 1x4 accumulation setup, but the
+  # RTX 4060 processes four independent windows concurrently.
+  batch_size: 4
+  gradient_accumulation_steps: 1
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  smooth_l1_beta: 0.5
+  normalization_epsilon: 1.0e-6
+  gradient_clip_norm: 1.0
+  num_workers: 2
+  device: auto
+  auto_resume: true

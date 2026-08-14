@@ -4,13 +4,14 @@
 
 ```text
 design: frozen
-implementation: not started
-training: not run
+implementation: complete
+training: controlled smoke only; full run not started
 performance claims: none
 ```
 
 This document freezes the first measured-data training baseline for the SNN
-Motion Backbone. It does not describe an implemented or trained capability.
+Motion Backbone. The data and training pipeline is implemented, but only a
+controlled two-window training smoke has run; no functional model is claimed.
 The task is camera-local ego-motion regression, not robot-base odometry,
 independent-object segmentation, collision prediction, or motor control.
 
@@ -63,8 +64,19 @@ Linear(64, 6)
 normalized camera-local SE(3) twist [B, 6]
 ```
 
-The backbone topology, LIF equation, threshold, time constants, calibrated
-layer gains, and local head are unchanged by this baseline.
+The backbone topology, LIF equation, threshold, time constants, and local head
+are unchanged by this baseline. The measured-data input audit found that the
+earlier binary-synthetic gain profile over-activated S5 and S6, so this
+baseline explicitly freezes a Samsung SFM initialization profile:
+
+```text
+S1, S2, S3, S4, S5, S6, primitive
+0.75, 2.5, 3.0, 3.0, 3.0, 3.0, 2.0
+```
+
+These static gains are folded into the initialized convolution weights. They
+do not add runtime multiplication or normalization and do not change the
+network topology. The generic backbone default remains unchanged.
 
 ## Input contract
 
@@ -195,7 +207,7 @@ sufficient performance report.
 
 ## Mandatory pre-training input audit
 
-The existing SNN excitability gains were calibrated with binary synthetic
+The earlier SNN excitability gains were calibrated with binary synthetic
 events. Spatially aggregated EVIMO2 cells can contain counts greater than one.
 Before optimization, run deterministic measured-data diagnostics and report:
 
@@ -210,6 +222,20 @@ No-motion input must remain silent. Any hidden-layer firing fraction above
 normalize, or binarize counts to make this audit pass. If the real input
 distribution is incompatible with the calibrated gains, record the evidence
 and revisit the encoding/calibration policy explicitly.
+
+The initial measured-data calibration used seed 17 and four deterministic SFM
+training windows. Before calibration, S5 and S6 fired at approximately 27.31%
+and 32.97%. With the frozen Samsung profile, the measured firing fractions
+were approximately:
+
+```text
+S1 1.81%   S2 1.62%   S3 1.31%   S4 1.08%
+S5 1.01%   S6 0.99%   primitive 0.32%
+```
+
+The executable preflight repeats this audit on the configured window count
+before every new or resumed training run. These figures establish a numerical
+initialization point only; they are not task-performance results.
 
 ## Initial training boundary
 
@@ -262,6 +288,7 @@ native resolution:            480 x 640
 model resolution:             96 x 128
 spatial reduction:            exact 5 x event-coordinate aggregation
 state policy:                 reset per independent window
+EVIMO2 layer gains:           0.75, 2.5, 3, 3, 3, 3, 2
 ```
 
 Optimizer, learning rate, batch size, sampling stride, normalization epsilon,

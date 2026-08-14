@@ -32,12 +32,15 @@ class EVIMO2EventConfig:
 
     timesteps: int = 32
     dt_ms: float = 1.0
+    spatial_reduction: int = 1
 
     def __post_init__(self) -> None:
         if self.timesteps <= 0:
             raise ValueError("timesteps must be positive")
         if not math.isfinite(self.dt_ms) or self.dt_ms <= 0.0:
             raise ValueError("dt_ms must be finite and positive")
+        if self.spatial_reduction <= 0:
+            raise ValueError("spatial_reduction must be a positive integer")
 
     @property
     def duration_s(self) -> float:
@@ -190,8 +193,8 @@ class EVIMO2Sequence:
         camera_meta = meta["meta"]
         self.height = int(camera_meta["res_y"])
         self.width = int(camera_meta["res_x"])
-        self._frames = {
-            int(frame["id"]): frame
+        self._frame_times = {
+            int(frame["id"]): float(frame["ts"])
             for frame in meta["frames"]
             if isinstance(frame.get("id"), (int, np.integer))
             and int(frame["id"]) < np.iinfo(np.uint64).max
@@ -199,6 +202,60 @@ class EVIMO2Sequence:
         self._trajectory_times, self._trajectory_poses = self._camera_trajectory(
             meta["full_trajectory"]
         )
+        if self.height % self.config.spatial_reduction or self.width % self.config.spatial_reduction:
+            raise ValueError(
+                "sensor resolution must be divisible by spatial_reduction"
+            )
+
+    @property
+    def output_height(self) -> int:
+        return self.height // self.config.spatial_reduction
+
+    @property
+    def output_width(self) -> int:
+        return self.width // self.config.spatial_reduction
+
+    @property
+    def frame_ids(self) -> tuple[int, ...]:
+        """Ground-truth frame identifiers ordered by timestamp then ID."""
+
+        return tuple(
+            frame_id
+            for frame_id, _timestamp in sorted(
+                self._frame_times.items(), key=lambda item: (item[1], item[0])
+            )
+        )
+
+    def frame_time(self, frame_id: int) -> float:
+        try:
+            return self._frame_times[frame_id]
+        except KeyError as error:
+            raise KeyError(f"unknown EVIMO2 ground-truth frame id: {frame_id}") from error
+
+    def can_sample_at_time(self, end_time_s: float) -> bool:
+        """Return whether the camera trajectory covers the complete window."""
+
+        start_time_s = end_time_s - self.config.duration_s
+        return bool(
+            math.isfinite(end_time_s)
+            and self._trajectory_times[0] <= start_time_s
+            and end_time_s <= self._trajectory_times[-1]
+        )
+
+    def ego_motion_at_time(self, end_time_s: float) -> Tensor:
+        """Compute only the camera-local twist without materializing events."""
+
+        if not self.can_sample_at_time(end_time_s):
+            raise ValueError("requested window is outside the camera trajectory")
+        start_time_s = end_time_s - self.config.duration_s
+        twist = _se3_twist_per_second(
+            self._pose_at(start_time_s),
+            self._pose_at(end_time_s),
+            self.config.duration_s,
+        )
+        if not np.isfinite(twist).all():
+            raise ValueError("derived camera ego-motion contains non-finite values")
+        return torch.from_numpy(twist.astype(np.float32))
 
     @staticmethod
     def _camera_trajectory(records: list[dict[str, Any]]) -> tuple[np.ndarray, tuple[_Pose, ...]]:
@@ -254,11 +311,7 @@ class EVIMO2Sequence:
     def sample_at_frame(self, frame_id: int) -> EVIMO2EgoMotionSample:
         """Create the event window ending at one official ground-truth frame."""
 
-        try:
-            frame = self._frames[frame_id]
-        except KeyError as error:
-            raise KeyError(f"unknown EVIMO2 ground-truth frame id: {frame_id}") from error
-        return self.sample_at_time(float(frame["ts"]), frame_id=frame_id)
+        return self.sample_at_time(self.frame_time(frame_id), frame_id=frame_id)
 
     def sample_at_time(
         self, end_time_s: float, *, frame_id: int | None = None
@@ -268,8 +321,8 @@ class EVIMO2Sequence:
         if not math.isfinite(end_time_s):
             raise ValueError("end_time_s must be finite")
         start_time_s = end_time_s - self.config.duration_s
-        start_pose = self._pose_at(start_time_s)
-        end_pose = self._pose_at(end_time_s)
+        if not self.can_sample_at_time(end_time_s):
+            raise ValueError("requested window is outside the camera trajectory")
 
         first = int(np.searchsorted(self._event_t, start_time_s, side="left"))
         last = int(np.searchsorted(self._event_t, end_time_s, side="left"))
@@ -290,8 +343,14 @@ class EVIMO2Sequence:
         time_bins = np.floor((timestamps - start_time_s) / dt_s).astype(np.int64)
         if time_bins.size:
             time_bins = np.clip(time_bins, 0, self.config.timesteps - 1)
+        if self.config.spatial_reduction != 1 and coordinates.size:
+            # COMPATIBILITY_PATCH: reduce exact event coordinates before dense
+            # binning so a 64 ms Samsung window never allocates a native-resolution
+            # intermediate tensor. Counts, timestamps, and polarity are preserved.
+            coordinates = coordinates // self.config.spatial_reduction
         event_counts = np.zeros(
-            (self.config.timesteps, 2, self.height, self.width), dtype=np.int32
+            (self.config.timesteps, 2, self.output_height, self.output_width),
+            dtype=np.int32,
         )
         if len(timestamps):
             np.add.at(
@@ -300,14 +359,9 @@ class EVIMO2Sequence:
                 1,
             )
 
-        twist = _se3_twist_per_second(
-            start_pose, end_pose, self.config.duration_s
-        )
-        if not np.isfinite(twist).all():
-            raise ValueError("derived camera ego-motion contains non-finite values")
         return EVIMO2EgoMotionSample(
             events=torch.from_numpy(event_counts).to(dtype=torch.float32),
-            ego_motion=torch.from_numpy(twist.astype(np.float32)),
+            ego_motion=self.ego_motion_at_time(end_time_s),
             start_time_s=start_time_s,
             end_time_s=end_time_s,
             sensor=self.sensor,

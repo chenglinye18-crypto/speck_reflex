@@ -237,7 +237,8 @@ future independent-motion mask
 
 The complete 64 ms Samsung Structure-from-Motion baseline contract is frozen
 in [EVIMO2_EGO_MOTION_BASELINE.md](EVIMO2_EGO_MOTION_BASELINE.md). Its training
-implementation has not started and no accuracy claim is made.
+pipeline is implemented and has passed a controlled two-window smoke run. A
+full training run has not started and no accuracy claim is made.
 
 ## Verified example
 

@@ -21,6 +21,7 @@ packages = [
   "software.models",
   "software.models.snn",
   "software.simulation",
+  "software.training",
   "hardware",
   "hardware.interfaces",
 ]

@@ -7,7 +7,14 @@ import numpy as np
 import pytest
 import torch
 
-from software.datasets import EVIMO2EventConfig, EVIMO2Sensor, EVIMO2Sequence
+from software.datasets import (
+    EVIMO2EgoMotionDataset,
+    EVIMO2EventConfig,
+    EVIMO2Sensor,
+    EVIMO2Sequence,
+    TargetNormalization,
+    build_ego_motion_index,
+)
 
 
 def _pose(timestamp: float, x: float, yaw: float = 0.0) -> dict:
@@ -26,8 +33,15 @@ def _pose(timestamp: float, x: float, yaw: float = 0.0) -> dict:
     }
 
 
-def _write_sequence(path: Path, *, translation_m: float = 0.01, yaw_rad: float = 0.0) -> None:
-    path.mkdir()
+def _write_sequence(
+    path: Path,
+    *,
+    translation_m: float = 0.01,
+    yaw_rad: float = 0.0,
+    width: int = 4,
+    height: int = 3,
+) -> None:
+    path.mkdir(parents=True)
     np.save(path / "dataset_events_t.npy", np.array([0.0005, 0.0012, 0.0014, 0.0039, 0.0040], dtype=np.float32))
     np.save(
         path / "dataset_events_xy.npy",
@@ -41,7 +55,7 @@ def _write_sequence(path: Path, *, translation_m: float = 0.01, yaw_rad: float =
             {"ts": 0.01, "cam": _pose(0.01, translation_m, yaw_rad)},
         ],
         "imu": {},
-        "meta": {"res_x": 4, "res_y": 3},
+        "meta": {"res_x": width, "res_y": height},
     }
     np.savez(
         path / "dataset_info.npz",
@@ -139,3 +153,79 @@ def test_window_outside_trajectory_is_rejected(tmp_path: Path) -> None:
     sequence = EVIMO2Sequence(sequence_path, sensor=EVIMO2Sensor.LEFT_CAMERA)
     with pytest.raises(ValueError, match="outside the camera trajectory"):
         sequence.sample_at_time(0.02)
+
+
+@pytest.mark.unit
+def test_event_coordinate_reduction_preserves_counts_and_polarity(tmp_path: Path) -> None:
+    sequence_path = tmp_path / "sequence"
+    _write_sequence(sequence_path, width=10, height=10)
+    native = EVIMO2Sequence(
+        sequence_path,
+        sensor=EVIMO2Sensor.LEFT_CAMERA,
+        config=EVIMO2EventConfig(timesteps=4, dt_ms=1.0),
+    ).sample_at_frame(7)
+    reduced = EVIMO2Sequence(
+        sequence_path,
+        sensor=EVIMO2Sensor.LEFT_CAMERA,
+        config=EVIMO2EventConfig(timesteps=4, dt_ms=1.0, spatial_reduction=2),
+    ).sample_at_frame(7)
+    assert reduced.events.shape == (4, 2, 5, 5)
+    assert reduced.events.sum() == native.events.sum() == 4
+    assert reduced.events[1, 1, 0, 1].item() == 2
+
+
+@pytest.mark.unit
+def test_sequence_split_index_and_target_normalization_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "samsung_mono"
+    for index in range(3):
+        _write_sequence(
+            root / "sfm" / "train" / f"train_{index}",
+            translation_m=0.01 * (index + 1),
+            width=10,
+            height=10,
+        )
+    _write_sequence(
+        root / "sfm" / "eval" / "test_0",
+        translation_m=0.04,
+        width=10,
+        height=10,
+    )
+    config = EVIMO2EventConfig(timesteps=4, dt_ms=1.0, spatial_reduction=2)
+    first = build_ego_motion_index(
+        root,
+        event_config=config,
+        frame_stride=1,
+        validation_fraction=0.34,
+        seed=17,
+    )
+    second = build_ego_motion_index(
+        root,
+        event_config=config,
+        frame_stride=1,
+        validation_fraction=0.34,
+        seed=17,
+    )
+    assert first == second
+    assert len(first.train) == 2
+    assert len(first.validation) == 1
+    assert len(first.test) == 1
+    split_sequences = [
+        {record.sequence for record in records}
+        for records in (first.train, first.validation, first.test)
+    ]
+    assert split_sequences[0].isdisjoint(split_sequences[1])
+    assert split_sequences[0].isdisjoint(split_sequences[2])
+    assert split_sequences[1].isdisjoint(split_sequences[2])
+
+    normalization = TargetNormalization.fit(first.train, epsilon=1e-6)
+    targets = torch.tensor([record.ego_motion for record in first.train])
+    assert torch.allclose(
+        normalization.denormalize(normalization.normalize(targets)), targets
+    )
+    sample = EVIMO2EgoMotionDataset(
+        root, first.train, event_config=config
+    )[0]
+    assert sample["events"].shape == (4, 2, 5, 5)
+    assert sample["ego_motion"].shape == (6,)
