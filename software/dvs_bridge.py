@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import json
 import socketserver
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 from torch import Tensor
@@ -29,6 +31,8 @@ INPUT_KIND = "frame_difference_proxy"
 FROZEN_TIMESTEPS = 64
 FROZEN_DT_US = 1_000
 FROZEN_SPATIAL_REDUCTION = 5
+FROZEN_SENSOR_WIDTH = 640
+FROZEN_SENSOR_HEIGHT = 480
 
 
 def event_window_from_message(message: dict[str, Any]) -> EventWindow:
@@ -75,8 +79,11 @@ def window_to_event_bins(window: EventWindow) -> Tensor:
         raise ValueError(
             f"window duration must be {expected_duration} us, got {duration} us"
         )
-    if window.width % FROZEN_SPATIAL_REDUCTION or window.height % FROZEN_SPATIAL_REDUCTION:
-        raise ValueError("sensor dimensions must be divisible by spatial reduction 5")
+    if (window.width, window.height) != (FROZEN_SENSOR_WIDTH, FROZEN_SENSOR_HEIGHT):
+        raise ValueError(
+            "sensor dimensions must be 640x480 for the frozen bridge contract, "
+            f"got {window.width}x{window.height}"
+        )
     bins = torch.zeros(
         (
             1,
@@ -102,6 +109,58 @@ def window_to_event_bins(window: EventWindow) -> Tensor:
     return bins
 
 
+def _motion_response(
+    window: EventWindow,
+    *,
+    model_id: str,
+    values: list[float],
+    tensor: Tensor,
+    inference_latency_ms: float,
+) -> dict[str, object]:
+    return {
+        "protocol": PROTOCOL,
+        "type": "camera_local_motion",
+        "model_id": model_id,
+        "timestamp_us": window.end_timestamp_us,
+        "event_count": len(window.events),
+        "ego_motion_vw": values,
+        "advisory_only": True,
+        "input_kind": INPUT_KIND,
+        "server_diagnostics": {
+            "tensor_shape": list(tensor.shape),
+            "tensor_dtype": str(tensor.dtype),
+            "inference_latency_ms": inference_latency_ms,
+        },
+    }
+
+
+class BridgePredictor(Protocol):
+    model_id: str
+    device: object
+
+    def predict(self, window: EventWindow) -> dict[str, object]: ...
+
+
+@dataclass(slots=True)
+class DummyEgoMotionModel:
+    """Interface-only predictor that validates and bins events without a model."""
+
+    model_id: str = "dummy-interface-v0"
+    device: str = "dummy"
+
+    def predict(self, window: EventWindow) -> dict[str, object]:
+        started = time.monotonic()
+        event_bins = window_to_event_bins(window)
+        elapsed_ms = (time.monotonic() - started) * 1_000.0
+        return _motion_response(
+            window,
+            model_id=self.model_id,
+            values=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            tensor=event_bins,
+            inference_latency_ms=elapsed_ms,
+        )
+
+
 @dataclass(slots=True)
 class LiveEgoMotionModel:
     """Read-only checkpoint adapter for advisory camera-local motion output."""
@@ -115,7 +174,9 @@ class LiveEgoMotionModel:
     def load(cls, checkpoint_path: str | Path, *, device: str = "auto") -> "LiveEgoMotionModel":
         resolved = Path(checkpoint_path).expanduser().resolve()
         resolved_device = torch.device(
-            "cuda" if device == "auto" and torch.cuda.is_available() else device
+            "cuda" if device == "auto" and torch.cuda.is_available()
+            else "cpu" if device == "auto"
+            else device
         )
         checkpoint = torch.load(resolved, map_location=resolved_device, weights_only=True)
         if checkpoint.get("task") != "evimo2_samsung_camera_local_ego_motion":
@@ -136,44 +197,112 @@ class LiveEgoMotionModel:
 
     def predict(self, window: EventWindow) -> dict[str, object]:
         event_bins = window_to_event_bins(window).to(self.device, non_blocking=True)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        started = time.monotonic()
         with torch.inference_mode():
             self.model.reset_state()
             output = self.model(event_bins)
             self.model.reset_state()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        inference_latency_ms = (time.monotonic() - started) * 1_000.0
         if output.ego_motion is None:
             raise RuntimeError("loaded model does not have an ego-motion head")
         normalized = output.ego_motion.mean(dim=1)
         motion = self.normalizer.denormalize(normalized).squeeze(0).to("cpu")
-        return {
-            "protocol": PROTOCOL,
-            "type": "camera_local_motion",
-            "model_id": self.model_id,
-            "timestamp_us": window.end_timestamp_us,
-            "event_count": len(window.events),
-            "ego_motion_vw": [float(value) for value in motion.tolist()],
-            "advisory_only": True,
-            "input_kind": INPUT_KIND,
-            "warning": (
-                "EVIMO2 Samsung-camera baseline; uncalibrated for Glarus and "
-                "not a robot-motion, collision-risk, or safety output."
-            ),
-        }
+        if not torch.isfinite(motion).all():
+            raise RuntimeError("model produced non-finite ego-motion output")
+        response = _motion_response(
+            window,
+            model_id=self.model_id,
+            values=[float(value) for value in motion.tolist()],
+            tensor=event_bins,
+            inference_latency_ms=inference_latency_ms,
+        )
+        response["warning"] = (
+            "EVIMO2 Samsung-camera baseline; uncalibrated for Glarus and "
+            "not a robot-motion, collision-risk, or safety output."
+        )
+        return response
+
+
+@dataclass(slots=True)
+class BridgeServerDiagnostics:
+    requests_received: int = 0
+    _last_log_monotonic: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def begin_request(self) -> int:
+        with self._lock:
+            self.requests_received += 1
+            return self.requests_received
+
+    def finish_request(
+        self,
+        response: dict[str, object],
+        *,
+        request_number: int,
+        processing_latency_ms: float,
+    ) -> None:
+        diagnostics = response.setdefault("server_diagnostics", {})
+        if isinstance(diagnostics, dict):
+            diagnostics["requests_received"] = request_number
+            diagnostics["processing_latency_ms"] = processing_latency_ms
+            diagnostics["response_type"] = response.get("type")
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_log_monotonic < 1.0:
+                return
+            self._last_log_monotonic = now
+        event_count = response.get("event_count", "--")
+        tensor_shape = diagnostics.get("tensor_shape", "--") if isinstance(diagnostics, dict) else "--"
+        inference_ms = (
+            diagnostics.get("inference_latency_ms", "--")
+            if isinstance(diagnostics, dict)
+            else "--"
+        )
+        print(
+            "bridge_stats "
+            f"requests_received={request_number} event_count={event_count} "
+            f"tensor_shape={tensor_shape} inference_latency_ms={inference_ms} "
+            f"response_type={response.get('type')}",
+            flush=True,
+        )
 
 
 class _BridgeRequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         for raw_line in self.rfile:
+            started = time.monotonic()
+            request_number = self.server.diagnostics.begin_request()  # type: ignore[attr-defined]
             if len(raw_line) > 16 * 1024 * 1024:
-                self._write({"type": "error", "error": "message exceeds 16 MiB"})
+                response = {
+                    "protocol": PROTOCOL,
+                    "type": "error",
+                    "error": "message exceeds 16 MiB",
+                }
+                self.server.diagnostics.finish_request(  # type: ignore[attr-defined]
+                    response,
+                    request_number=request_number,
+                    processing_latency_ms=(time.monotonic() - started) * 1_000.0,
+                )
+                self._write(response)
                 return
             try:
                 message = json.loads(raw_line)
                 if not isinstance(message, dict):
                     raise TypeError("message must be a JSON object")
                 window = event_window_from_message(message)
-                response = self.server.model.predict(window)  # type: ignore[attr-defined]
+                with self.server.inference_lock:  # type: ignore[attr-defined]
+                    response = self.server.model.predict(window)  # type: ignore[attr-defined]
             except Exception as exc:
                 response = {"protocol": PROTOCOL, "type": "error", "error": str(exc)}
+            self.server.diagnostics.finish_request(  # type: ignore[attr-defined]
+                response,
+                request_number=request_number,
+                processing_latency_ms=(time.monotonic() - started) * 1_000.0,
+            )
             self._write(response)
 
     def _write(self, response: dict[str, object]) -> None:
@@ -187,19 +316,30 @@ class DvsMotionBridgeServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], model: LiveEgoMotionModel):
+    def __init__(self, address: tuple[str, int], model: BridgePredictor):
         super().__init__(address, _BridgeRequestHandler)
         self.model = model
+        self.inference_lock = threading.Lock()
+        self.diagnostics = BridgeServerDiagnostics()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve the local DVS motion bridge.")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--dummy", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     args = parser.parse_args()
-    model = LiveEgoMotionModel.load(args.checkpoint, device=args.device)
+    if args.dummy and args.checkpoint is not None:
+        parser.error("--dummy and --checkpoint are mutually exclusive")
+    if not args.dummy and args.checkpoint is None:
+        parser.error("--checkpoint is required unless --dummy is used")
+    model: BridgePredictor = (
+        DummyEgoMotionModel()
+        if args.dummy
+        else LiveEgoMotionModel.load(args.checkpoint, device=args.device)
+    )
     with DvsMotionBridgeServer((args.host, args.port), model) as server:
         print(
             f"DVS_MOTION_BRIDGE_READY host={args.host} port={args.port} "
