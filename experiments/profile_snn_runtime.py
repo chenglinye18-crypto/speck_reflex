@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Baseline CUDA latency decomposition for the frozen SNNMotionBackbone.
+"""CUDA runtime comparison for reference and fused SNNMotionBackbone LIFs.
 
 This is a measurement-only tool.  It does not change the model topology,
 weights, or neuron equations.  The per-stage path mirrors ``forward`` in this
@@ -27,6 +27,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from software.dvs_bridge import LiveEgoMotionModel
+from software.models.snn.motion_backbone import SNNMotionBackbone
 
 
 STAGE_NAMES = ("S1", "S2", "S3", "S4", "S5", "S6", "primitive")
@@ -226,8 +227,10 @@ def aggregate_diagnostic(
     return values
 
 
-def profiler_summary(model: torch.nn.Module, event_bins: Tensor, device: torch.device, runs: int) -> None:
-    """Print a concise in-memory profiler summary; deliberately no large trace file."""
+def profiler_summary(
+    label: str, model: torch.nn.Module, event_bins: Tensor, device: torch.device, runs: int
+) -> dict[str, int]:
+    """Print concise profiler counters; deliberately no large trace file."""
 
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
     model.reset_state()
@@ -237,10 +240,29 @@ def profiler_summary(model: torch.nn.Module, event_bins: Tensor, device: torch.d
             model(event_bins)
             model.reset_state()
     torch.cuda.synchronize(device)
-    cuda_events = sum(1 for event in prof.events() if event.device_type == torch.autograd.DeviceType.CUDA)
-    print("\nProfiler Evidence (instrumented short run; no trace file written)")
+    cuda_events = sum(
+        1 for event in prof.events() if event.device_type == torch.autograd.DeviceType.CUDA
+    )
+    op_counts = {event.key: event.count for event in prof.key_averages()}
+    print(f"\nProfiler Evidence: {label} (instrumented short run; no trace file written)")
     print(f"CUDA kernel/activity events: {cuda_events}")
+    print(
+        "op calls: "
+        f"cat={op_counts.get('aten::cat', 0)} "
+        f"split={op_counts.get('aten::split_with_sizes', 0) + op_counts.get('aten::split', 0)} "
+        f"mul={op_counts.get('aten::mul', 0)} add={op_counts.get('aten::add', 0)} "
+        f"sub={op_counts.get('aten::sub', 0)} ge={op_counts.get('aten::ge', 0)}"
+    )
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+    return {
+        "cuda_activities": cuda_events,
+        "cat": op_counts.get("aten::cat", 0),
+        "split": op_counts.get("aten::split_with_sizes", 0) + op_counts.get("aten::split", 0),
+        "mul": op_counts.get("aten::mul", 0),
+        "add": op_counts.get("aten::add", 0),
+        "sub": op_counts.get("aten::sub", 0),
+        "ge": op_counts.get("aten::ge", 0),
+    }
 
 
 def print_table(title: str, measurements: dict[str, list[float]], ordered_names: Iterable[str]) -> None:
@@ -262,6 +284,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def make_variant(
+    reference: SNNMotionBackbone,
+    *,
+    lif_implementation: str,
+    inference_fast_spike: bool,
+    device: torch.device,
+) -> SNNMotionBackbone:
+    """Build a runtime-only variant from exactly the loaded checkpoint state."""
+
+    variant = SNNMotionBackbone(
+        reference.config,
+        lif_implementation=lif_implementation,
+        inference_fast_spike=inference_fast_spike,
+    ).to(device)
+    variant.load_state_dict(reference.state_dict(), strict=True)
+    variant.eval()
+    return variant
+
+
 def main() -> None:
     args = parse_args()
     if args.device != "cuda" or not torch.cuda.is_available():
@@ -271,7 +312,19 @@ def main() -> None:
 
     device = torch.device(args.device)
     loaded = LiveEgoMotionModel.load(args.checkpoint, device=args.device)
-    model = loaded.model
+    reference = loaded.model
+    variants = {
+        "R0 reference": reference,
+        "R1 reference + fast spike": make_variant(
+            reference, lif_implementation="reference", inference_fast_spike=True, device=device
+        ),
+        "R2 fused": make_variant(
+            reference, lif_implementation="fused", inference_fast_spike=False, device=device
+        ),
+        "R3 fused + fast spike": make_variant(
+            reference, lif_implementation="fused", inference_fast_spike=True, device=device
+        ),
+    }
     print("Environment")
     print(f"GPU: {torch.cuda.get_device_name(device)}")
     print(f"torch: {torch.__version__}")
@@ -281,25 +334,31 @@ def main() -> None:
 
     cpu_input = make_cpu_input(64)
     gpu_input = cpu_input.to(device)
-    warmup(model, gpu_input, args.warmup, device)
-    baseline = measure_baseline(model, cpu_input, device, args.runs)
-    print_table("Baseline Runtime (normal forward)", baseline, ("H2D", "reset_before", "forward", "reset_after", "total"))
+    variant_results: dict[str, dict[str, float]] = {}
+    print("\nPerformance (normal forward; CUDA events)")
+    print(f"{'Variant':<28} {'p50 ms':>10} {'p95 ms':>10} {'mean ms':>10} {'speedup':>10}")
+    for label, model in variants.items():
+        warmup(model, gpu_input, args.warmup, device)
+        samples = normal_forward_samples(model, gpu_input, device, args.runs)
+        variant_results[label] = summarize(samples)
+    baseline_p50 = variant_results["R0 reference"]["p50"]
+    for label, summary in variant_results.items():
+        print(
+            f"{label:<28} {summary['p50']:10.3f} {summary['p95']:10.3f} "
+            f"{summary['mean']:10.3f} {baseline_p50 / summary['p50']:9.3f}x"
+        )
 
-    print("\nT Scaling (normal forward; fixed B=1,C=2,H=96,W=128)")
+    optimized = variants["R3 fused + fast spike"]
+    print("\nT Scaling: R3 fused + fast spike (fixed B=1,C=2,H=96,W=128)")
     print(f"{'T':>4} {'forward p50 ms':>16} {'forward p95 ms':>16} {'ms/timestep p50':>18}")
-    for timesteps in (1, 2, 4, 8, 16, 32, 64):
+    for timesteps in (1, 8, 32, 64):
         event_bins = make_cpu_input(timesteps).to(device)
-        warmup(model, event_bins, args.warmup, device)
-        samples = normal_forward_samples(model, event_bins, device, args.runs)
+        warmup(optimized, event_bins, args.warmup, device)
+        samples = normal_forward_samples(optimized, event_bins, device, args.runs)
         summary = summarize(samples)
         print(f"{timesteps:4d} {summary['p50']:16.3f} {summary['p95']:16.3f} {summary['p50'] / timesteps:18.3f}")
-
-    # Events add CPU bookkeeping but no stream synchronizations between stages.
-    stage_values = aggregate_diagnostic(lambda: diagnostic_stage_once(model, gpu_input, device), args.runs)
-    print_table("Stage Breakdown (instrumented diagnostic, not end-to-end)", stage_values, (*STAGE_NAMES, *HEAD_NAMES))
-    conv_lif_values = aggregate_diagnostic(lambda: conv_lif_once(model, gpu_input, device), args.runs)
-    print_table("Conv vs LIF (instrumented diagnostic, not end-to-end)", conv_lif_values, ("Conv", "LIF", "other"))
-    profiler_summary(model, gpu_input, device, args.profiler_runs)
+    profiler_summary("R0 reference", reference, gpu_input, device, args.profiler_runs)
+    profiler_summary("R3 fused + fast spike", optimized, gpu_input, device, args.profiler_runs)
 
 
 if __name__ == "__main__":

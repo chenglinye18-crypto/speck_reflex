@@ -12,7 +12,7 @@ from torch.nn import functional as F
 
 from .config import SNNMotionConfig
 from .layers import ConvLIFBlock
-from .neurons import LIF
+from .neurons import FusedMultiTimescaleLIF, LIF
 
 
 @dataclass(slots=True)
@@ -77,9 +77,19 @@ class SNNMotionBackbone(nn.Module):
     _STRIDES = (2, 1, 2, 1, 1, 1)
     _PADDINGS = (2, 1, 1, 2, 2, 1)
 
-    def __init__(self, config: SNNMotionConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: SNNMotionConfig | None = None,
+        *,
+        lif_implementation: str = "reference",
+        inference_fast_spike: bool = False,
+    ) -> None:
         super().__init__()
         self.config = config or SNNMotionConfig()
+        if lif_implementation not in {"reference", "fused"}:
+            raise ValueError("lif_implementation must be 'reference' or 'fused'")
+        self.lif_implementation = lif_implementation
+        self.inference_fast_spike = inference_fast_spike
 
         stage_inputs = (self.config.input_channels, *self.config.channels[:-1])
         self.stages = nn.ModuleList(
@@ -131,6 +141,8 @@ class SNNMotionBackbone(nn.Module):
             threshold=self.config.threshold,
             fast_ratio=self.config.fast_ratio,
             surrogate=self.config.surrogate,
+            lif_implementation=self.lif_implementation,
+            inference_fast_spike=self.inference_fast_spike,
         )
 
     def forward(self, event_bins: Tensor) -> SNNMotionOutput:
@@ -178,7 +190,7 @@ class SNNMotionBackbone(nn.Module):
         """Clear every neuron state at a new-sequence boundary."""
 
         for neuron in self.modules():
-            if isinstance(neuron, LIF):
+            if isinstance(neuron, (LIF, FusedMultiTimescaleLIF)):
                 neuron.reset_state()
 
     def forward_with_stats(self, event_bins: Tensor) -> SNNMotionRun:
@@ -234,7 +246,7 @@ class SNNMotionBackbone(nn.Module):
         """Preserve membrane values while cutting the truncated-BPTT graph."""
 
         for neuron in self.modules():
-            if isinstance(neuron, LIF):
+            if isinstance(neuron, (LIF, FusedMultiTimescaleLIF)):
                 neuron.detach_state()
 
     def membrane_states(self) -> tuple[Tensor, ...]:
@@ -243,7 +255,8 @@ class SNNMotionBackbone(nn.Module):
         return tuple(
             neuron.membrane_state
             for neuron in self.modules()
-            if isinstance(neuron, LIF) and neuron.membrane_state is not None
+            if isinstance(neuron, (LIF, FusedMultiTimescaleLIF))
+            and neuron.membrane_state is not None
         )
 
     def parameter_count(self) -> int:

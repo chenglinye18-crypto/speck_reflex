@@ -16,10 +16,11 @@ from .diagnostics import (
     SNNNumericalDiagnostics,
     SignedCurrentDiagnostics,
 )
-from .neurons import LIF, MultiTimescaleLIF
+from .neurons import FusedMultiTimescaleLIF, LIF, MultiTimescaleLIF
 
 __all__ = [
     "LIF",
+    "FusedMultiTimescaleLIF",
     "DistributionStatistics",
     "LayerNumericalDiagnostics",
     "MembraneStatistics",
