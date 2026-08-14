@@ -115,7 +115,7 @@ def _motion_response(
     model_id: str,
     values: list[float],
     tensor: Tensor,
-    inference_latency_ms: float,
+    diagnostics: dict[str, object],
 ) -> dict[str, object]:
     return {
         "protocol": PROTOCOL,
@@ -129,7 +129,7 @@ def _motion_response(
         "server_diagnostics": {
             "tensor_shape": list(tensor.shape),
             "tensor_dtype": str(tensor.dtype),
-            "inference_latency_ms": inference_latency_ms,
+            **diagnostics,
         },
     }
 
@@ -157,7 +157,7 @@ class DummyEgoMotionModel:
             model_id=self.model_id,
             values=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             tensor=event_bins,
-            inference_latency_ms=elapsed_ms,
+            diagnostics={"model_inference_ms": elapsed_ms},
         )
 
 
@@ -169,6 +169,16 @@ class LiveEgoMotionModel:
     normalizer: TargetNormalization
     device: torch.device
     model_id: str
+
+    @property
+    def runtime_backend(self) -> dict[str, object]:
+        return {
+            "lif_backend": getattr(self.model, "lif_implementation", "unknown"),
+            "execution_mode": self.model.execution_mode,
+            "inference_fast_spike": getattr(self.model, "inference_fast_spike", False),
+            "ego_only_path": True,
+            "batched_pool": True,
+        }
 
     @classmethod
     def load(cls, checkpoint_path: str | Path, *, device: str = "auto") -> "LiveEgoMotionModel":
@@ -200,10 +210,25 @@ class LiveEgoMotionModel:
         )
 
     def predict(self, window: EventWindow) -> dict[str, object]:
-        event_bins = window_to_event_bins(window).to(self.device, non_blocking=True)
+        binning_started = time.monotonic()
+        event_bins_cpu = window_to_event_bins(window)
+        event_binning_ms = (time.monotonic() - binning_started) * 1_000.0
+        h2d_ms = 0.0
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-        started = time.monotonic()
+            h2d_start = torch.cuda.Event(enable_timing=True)
+            h2d_end = torch.cuda.Event(enable_timing=True)
+            h2d_start.record()
+            event_bins = event_bins_cpu.to(self.device, non_blocking=True)
+            h2d_end.record()
+            h2d_end.synchronize()
+            h2d_ms = h2d_start.elapsed_time(h2d_end)
+            inference_start = torch.cuda.Event(enable_timing=True)
+            inference_end = torch.cuda.Event(enable_timing=True)
+            inference_start.record()
+        else:
+            event_bins = event_bins_cpu.to(self.device)
+            started = time.monotonic()
         with torch.inference_mode():
             self.model.reset_state()
             if self.model.execution_mode == "stage_major_chunked":
@@ -215,8 +240,11 @@ class LiveEgoMotionModel:
                 normalized = output.ego_motion.mean(dim=1)
             self.model.reset_state()
         if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        inference_latency_ms = (time.monotonic() - started) * 1_000.0
+            inference_end.record()
+            inference_end.synchronize()
+            inference_latency_ms = inference_start.elapsed_time(inference_end)
+        else:
+            inference_latency_ms = (time.monotonic() - started) * 1_000.0
         motion = self.normalizer.denormalize(normalized).squeeze(0).to("cpu")
         if not torch.isfinite(motion).all():
             raise RuntimeError("model produced non-finite ego-motion output")
@@ -225,7 +253,12 @@ class LiveEgoMotionModel:
             model_id=self.model_id,
             values=[float(value) for value in motion.tolist()],
             tensor=event_bins,
-            inference_latency_ms=inference_latency_ms,
+            diagnostics={
+                "event_binning_ms": event_binning_ms,
+                "h2d_ms": h2d_ms,
+                "model_inference_ms": inference_latency_ms,
+                "runtime_backend": self.runtime_backend,
+            },
         )
         response["warning"] = (
             "EVIMO2 Samsung-camera baseline; uncalibrated for Glarus and "
@@ -237,6 +270,7 @@ class LiveEgoMotionModel:
 @dataclass(slots=True)
 class BridgeServerDiagnostics:
     requests_received: int = 0
+    responses_sent: int = 0
     _last_log_monotonic: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -251,11 +285,14 @@ class BridgeServerDiagnostics:
         *,
         request_number: int,
         processing_latency_ms: float,
+        response_serialization_ms: float,
     ) -> None:
         diagnostics = response.setdefault("server_diagnostics", {})
         if isinstance(diagnostics, dict):
             diagnostics["requests_received"] = request_number
+            diagnostics["responses_sent"] = self.responses_sent
             diagnostics["processing_latency_ms"] = processing_latency_ms
+            diagnostics["response_serialization_ms"] = response_serialization_ms
             diagnostics["response_type"] = response.get("type")
         now = time.monotonic()
         with self._lock:
@@ -265,14 +302,14 @@ class BridgeServerDiagnostics:
         event_count = response.get("event_count", "--")
         tensor_shape = diagnostics.get("tensor_shape", "--") if isinstance(diagnostics, dict) else "--"
         inference_ms = (
-            diagnostics.get("inference_latency_ms", "--")
+            diagnostics.get("model_inference_ms", "--")
             if isinstance(diagnostics, dict)
             else "--"
         )
         print(
             "bridge_stats "
             f"requests_received={request_number} event_count={event_count} "
-            f"tensor_shape={tensor_shape} inference_latency_ms={inference_ms} "
+            f"tensor_shape={tensor_shape} model_inference_ms={inference_ms} "
             f"response_type={response.get('type')}",
             flush=True,
         )
@@ -289,12 +326,17 @@ class _BridgeRequestHandler(socketserver.StreamRequestHandler):
                     "type": "error",
                     "error": "message exceeds 16 MiB",
                 }
+                serialization_started = time.monotonic()
+                json.dumps(response, separators=(",", ":"))
                 self.server.diagnostics.finish_request(  # type: ignore[attr-defined]
                     response,
                     request_number=request_number,
                     processing_latency_ms=(time.monotonic() - started) * 1_000.0,
+                    response_serialization_ms=(time.monotonic() - serialization_started) * 1_000.0,
                 )
                 self._write(response)
+                with self.server.diagnostics._lock:  # type: ignore[attr-defined]
+                    self.server.diagnostics.responses_sent += 1  # type: ignore[attr-defined]
                 return
             try:
                 message = json.loads(raw_line)
@@ -305,12 +347,17 @@ class _BridgeRequestHandler(socketserver.StreamRequestHandler):
                     response = self.server.model.predict(window)  # type: ignore[attr-defined]
             except Exception as exc:
                 response = {"protocol": PROTOCOL, "type": "error", "error": str(exc)}
+            serialization_started = time.monotonic()
+            json.dumps(response, separators=(",", ":"))
             self.server.diagnostics.finish_request(  # type: ignore[attr-defined]
                 response,
                 request_number=request_number,
                 processing_latency_ms=(time.monotonic() - started) * 1_000.0,
+                response_serialization_ms=(time.monotonic() - serialization_started) * 1_000.0,
             )
             self._write(response)
+            with self.server.diagnostics._lock:  # type: ignore[attr-defined]
+                self.server.diagnostics.responses_sent += 1  # type: ignore[attr-defined]
 
     def _write(self, response: dict[str, object]) -> None:
         self.wfile.write(json.dumps(response, separators=(",", ":")).encode() + b"\n")
@@ -348,9 +395,13 @@ def main() -> int:
         else LiveEgoMotionModel.load(args.checkpoint, device=args.device)
     )
     with DvsMotionBridgeServer((args.host, args.port), model) as server:
+        backend = (
+            model.runtime_backend if isinstance(model, LiveEgoMotionModel)
+            else {"lif_backend": "dummy", "execution_mode": "dummy"}
+        )
         print(
             f"DVS_MOTION_BRIDGE_READY host={args.host} port={args.port} "
-            f"device={model.device} model={model.model_id}",
+            f"device={model.device} model={model.model_id} backend={backend}",
             flush=True,
         )
         server.serve_forever()

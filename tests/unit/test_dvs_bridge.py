@@ -61,6 +61,7 @@ def test_dummy_mode_validates_bins_and_returns_fixed_finite_output() -> None:
     diagnostics = response["server_diagnostics"]
     assert diagnostics["tensor_shape"] == [1, 64, 2, 96, 128]
     assert diagnostics["tensor_dtype"] == "torch.float32"
+    assert "model_inference_ms" in diagnostics
 
 
 def test_bridge_rejects_wrong_window_duration() -> None:
