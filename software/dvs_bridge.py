@@ -183,10 +183,14 @@ class LiveEgoMotionModel:
             raise ValueError("checkpoint is not the EVIMO2 camera-local ego-motion baseline")
         model_cfg = checkpoint.get("config", {}).get("model", {})
         gains = tuple(float(value) for value in model_cfg["layer_gains"])
+        optimized_cuda = resolved_device.type == "cuda"
         model = SNNMotionBackbone(
-            SNNMotionConfig(enable_ego_head=True, layer_gains=gains)
+            SNNMotionConfig(enable_ego_head=True, layer_gains=gains),
+            lif_implementation="fused" if optimized_cuda else "reference",
+            inference_fast_spike=optimized_cuda,
+            execution_mode="stage_major_chunked" if optimized_cuda else "time_major",
         ).to(resolved_device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         model.eval()
         return cls(
             model=model,
@@ -202,14 +206,17 @@ class LiveEgoMotionModel:
         started = time.monotonic()
         with torch.inference_mode():
             self.model.reset_state()
-            output = self.model(event_bins)
+            if self.model.execution_mode == "stage_major_chunked":
+                normalized = self.model.forward_ego_motion(event_bins)
+            else:
+                output = self.model(event_bins)
+                if output.ego_motion is None:
+                    raise RuntimeError("loaded model does not have an ego-motion head")
+                normalized = output.ego_motion.mean(dim=1)
             self.model.reset_state()
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         inference_latency_ms = (time.monotonic() - started) * 1_000.0
-        if output.ego_motion is None:
-            raise RuntimeError("loaded model does not have an ego-motion head")
-        normalized = output.ego_motion.mean(dim=1)
         motion = self.normalizer.denormalize(normalized).squeeze(0).to("cpu")
         if not torch.isfinite(motion).all():
             raise RuntimeError("model produced non-finite ego-motion output")

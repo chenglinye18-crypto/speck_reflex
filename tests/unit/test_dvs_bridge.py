@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,10 +11,12 @@ from software.dvs_bridge import (
     FROZEN_DT_US,
     FROZEN_TIMESTEPS,
     INPUT_KIND,
+    LiveEgoMotionModel,
     PROTOCOL,
     event_window_from_message,
     window_to_event_bins,
 )
+from software.datasets.evimo2_ego_motion import TargetNormalization
 
 
 def _message(*, duration_us: int = FROZEN_TIMESTEPS * FROZEN_DT_US) -> dict[str, object]:
@@ -79,3 +82,52 @@ def test_bridge_rejects_wrong_protocol() -> None:
     message["protocol"] = "wrong/v0"
     with pytest.raises(ValueError, match="unsupported protocol"):
         event_window_from_message(message)
+
+
+class _BridgeModelStub:
+    def __init__(self, execution_mode: str) -> None:
+        self.execution_mode = execution_mode
+        self.ego_only_calls = 0
+        self.full_calls = 0
+        self.reset_calls = 0
+
+    def reset_state(self) -> None:
+        self.reset_calls += 1
+
+    def forward_ego_motion(self, event_bins: torch.Tensor) -> torch.Tensor:
+        assert tuple(event_bins.shape) == (1, 64, 2, 96, 128)
+        self.ego_only_calls += 1
+        return torch.arange(1, 7, dtype=torch.float32).unsqueeze(0)
+
+    def __call__(self, event_bins: torch.Tensor) -> SimpleNamespace:
+        assert tuple(event_bins.shape) == (1, 64, 2, 96, 128)
+        self.full_calls += 1
+        sequence = torch.arange(1, 7, dtype=torch.float32).reshape(1, 1, 6)
+        return SimpleNamespace(ego_motion=sequence.expand(1, 64, 6))
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "ego_only_calls", "full_calls"),
+    (("stage_major_chunked", 1, 0), ("time_major", 0, 1)),
+)
+def test_live_bridge_preserves_six_vector_with_optimized_and_fallback_paths(
+    execution_mode: str,
+    ego_only_calls: int,
+    full_calls: int,
+) -> None:
+    model = _BridgeModelStub(execution_mode)
+    predictor = LiveEgoMotionModel(
+        model=model,  # type: ignore[arg-type]
+        normalizer=TargetNormalization(
+            mean=torch.zeros(6), std=torch.ones(6), epsilon=1e-6
+        ),
+        device=torch.device("cpu"),
+        model_id="test-model",
+    )
+    response = predictor.predict(event_window_from_message(_message()))
+    assert response["ego_motion_vw"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert response["protocol"] == PROTOCOL
+    assert response["type"] == "camera_local_motion"
+    assert model.ego_only_calls == ego_only_calls
+    assert model.full_calls == full_calls
+    assert model.reset_calls == 2

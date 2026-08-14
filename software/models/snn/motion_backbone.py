@@ -167,6 +167,13 @@ class SNNMotionBackbone(nn.Module):
     def forward(self, event_bins: Tensor) -> SNNMotionOutput:
         """Process ``[B, T, C, H, W]`` OFF/ON bins without resetting state."""
 
+        self._validate_event_bins(event_bins)
+        if self.execution_mode in {"stage_major", "stage_major_chunked"}:
+            self._validate_stage_major_inference(event_bins)
+            return self._forward_stage_major(event_bins)
+        return self._forward_time_major(event_bins)
+
+    def _validate_event_bins(self, event_bins: Tensor) -> None:
         if event_bins.ndim != 5:
             raise ValueError("event_bins must have shape [B, T, C, H, W]")
         if event_bins.shape[2] != self.config.input_channels:
@@ -179,15 +186,14 @@ class SNNMotionBackbone(nn.Module):
         if not event_bins.is_floating_point():
             raise TypeError("event_bins must be a floating-point count or occupancy tensor")
 
-        if self.execution_mode in {"stage_major", "stage_major_chunked"}:
-            if torch.is_grad_enabled():
-                raise RuntimeError(
-                    "stage_major execution is inference-only; use torch.inference_mode()"
-                )
-            if event_bins.device.type != "cuda":
-                raise RuntimeError("stage_major execution is CUDA-only")
-            return self._forward_stage_major(event_bins)
-        return self._forward_time_major(event_bins)
+    @staticmethod
+    def _validate_stage_major_inference(event_bins: Tensor) -> None:
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "stage_major execution is inference-only; use torch.inference_mode()"
+            )
+        if event_bins.device.type != "cuda":
+            raise RuntimeError("stage_major execution is CUDA-only")
 
     def _forward_time_major(self, event_bins: Tensor) -> SNNMotionOutput:
         """Trusted reference schedule: complete all stages one timestep at a time."""
@@ -221,16 +227,7 @@ class SNNMotionBackbone(nn.Module):
     def _forward_stage_major(self, event_bins: Tensor) -> SNNMotionOutput:
         """Batch each stateless Conv over time while preserving sequential LIF state."""
 
-        spikes = event_bins
-        blocks = (*self.stages, self.primitive_bottleneck)
-        chunk_sizes = (
-            self._EXACT_TEMPORAL_BATCH_SIZES
-            if self.execution_mode == "stage_major_chunked"
-            else (None,) * len(blocks)
-        )
-        for block, chunk_size in zip(blocks, chunk_sizes, strict=True):
-            spikes = block.forward_sequence(spikes, temporal_batch_size=chunk_size)
-        primitives = spikes
+        primitives = self._forward_stage_major_primitives(event_bins)
 
         local_steps: list[Tensor] = []
         embedding_steps: list[Tensor] = []
@@ -249,6 +246,76 @@ class SNNMotionBackbone(nn.Module):
             global_embedding=torch.stack(embedding_steps, dim=1),
             ego_motion=torch.stack(ego_steps, dim=1) if ego_steps is not None else None,
         )
+
+    def _forward_stage_major_primitives(self, event_bins: Tensor) -> Tensor:
+        """Return the unchanged O2 primitive sequence without running any heads."""
+
+        spikes = event_bins
+        blocks = (*self.stages, self.primitive_bottleneck)
+        chunk_sizes = (
+            self._EXACT_TEMPORAL_BATCH_SIZES
+            if self.execution_mode == "stage_major_chunked"
+            else (None,) * len(blocks)
+        )
+        for block, chunk_size in zip(blocks, chunk_sizes, strict=True):
+            spikes = block.forward_sequence(spikes, temporal_batch_size=chunk_size)
+        return spikes
+
+    def forward_ego_motion(
+        self,
+        event_bins: Tensor,
+        *,
+        temporal_pool: bool = True,
+        temporal_head: bool = False,
+        mean_before_head: bool = False,
+    ) -> Tensor:
+        """Return the live bridge's normalized ``[B, 6]`` ego-motion output.
+
+        This CUDA inference-only path skips the unused local head. Diagnostic
+        flags expose O3 candidates; the exact production default batches only
+        adaptive pooling and retains the trusted per-timestep Linear calls.
+        """
+
+        self._validate_event_bins(event_bins)
+        if self.execution_mode != "stage_major_chunked":
+            raise RuntimeError(
+                "forward_ego_motion requires exact stage_major_chunked execution"
+            )
+        self._validate_stage_major_inference(event_bins)
+        if self.ego_motion_head is None:
+            raise RuntimeError("model does not have an ego-motion head")
+        if mean_before_head and temporal_head:
+            raise ValueError("mean_before_head and temporal_head are mutually exclusive")
+
+        primitives = self._forward_stage_major_primitives(event_bins)
+        batch, timesteps = primitives.shape[:2]
+        if temporal_pool:
+            merged = primitives.reshape(batch * timesteps, *primitives.shape[2:])
+            pooled = F.adaptive_avg_pool2d(merged, output_size=(2, 2)).flatten(1)
+            embeddings = pooled.reshape(batch, timesteps, -1)
+        else:
+            embeddings = torch.stack(
+                [
+                    F.adaptive_avg_pool2d(primitives[:, index], output_size=(2, 2))
+                    .flatten(1)
+                    for index in range(timesteps)
+                ],
+                dim=1,
+            )
+
+        if mean_before_head:
+            return self.ego_motion_head(embeddings.mean(dim=1))
+        if temporal_head:
+            merged_embeddings = embeddings.reshape(batch * timesteps, -1)
+            ego_sequence = self.ego_motion_head(merged_embeddings).reshape(
+                batch, timesteps, 6
+            )
+        else:
+            ego_sequence = torch.stack(
+                [self.ego_motion_head(embeddings[:, index]) for index in range(timesteps)],
+                dim=1,
+            )
+        return ego_sequence.mean(dim=1)
 
     def reset_state(self) -> None:
         """Clear every neuron state at a new-sequence boundary."""

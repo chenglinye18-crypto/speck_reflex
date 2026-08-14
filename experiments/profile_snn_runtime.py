@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CUDA runtime comparison for SNNMotionBackbone execution schedules.
+"""CUDA runtime comparison for SNNMotionBackbone O2/O3 inference paths.
 
 This is a measurement-only tool.  It does not change the model topology,
 weights, or neuron equations.  The per-stage path mirrors ``forward`` in this
@@ -340,6 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--runs", type=int, default=100)
     parser.add_argument("--profiler-runs", type=int, default=2)
+    parser.add_argument("--experiment", choices=("o2", "o3"), default="o3")
     return parser.parse_args()
 
 
@@ -475,6 +476,234 @@ def peak_forward_memory_mb(
     return peak / 2**20, (peak - baseline) / 2**20
 
 
+def operation_samples(
+    model: SNNMotionBackbone,
+    operation: Callable[[], Tensor],
+    device: torch.device,
+    *,
+    warmup_runs: int,
+    measured_runs: int,
+) -> list[float]:
+    """Benchmark a reset-isolated model operation with CUDA events."""
+
+    with torch.inference_mode():
+        for _ in range(warmup_runs):
+            model.reset_state()
+            operation()
+            model.reset_state()
+    torch.cuda.synchronize(device)
+    samples: list[float] = []
+    with torch.inference_mode():
+        for _ in range(measured_runs):
+            model.reset_state()
+            samples.append(cuda_elapsed_ms(device, operation))
+            model.reset_state()
+    return samples
+
+
+def peak_operation_memory_mb(
+    model: SNNMotionBackbone,
+    operation: Callable[[], Tensor],
+    device: torch.device,
+) -> tuple[float, float]:
+    model.reset_state()
+    torch.cuda.synchronize(device)
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    with torch.inference_mode():
+        output = operation()
+    torch.cuda.synchronize(device)
+    peak = torch.cuda.max_memory_allocated(device)
+    del output
+    model.reset_state()
+    return peak / 2**20, (peak - baseline) / 2**20
+
+
+def profile_operation(
+    label: str,
+    model: SNNMotionBackbone,
+    operation: Callable[[], Tensor],
+    device: torch.device,
+    runs: int,
+) -> dict[str, int]:
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    model.reset_state()
+    with torch.inference_mode(), torch.profiler.profile(activities=activities) as prof:
+        for _ in range(runs):
+            model.reset_state()
+            operation()
+            model.reset_state()
+    torch.cuda.synchronize(device)
+    cuda_events = sum(
+        1 for event in prof.events() if event.device_type == torch.autograd.DeviceType.CUDA
+    )
+    counts = {event.key: event.count for event in prof.key_averages()}
+    summary = {
+        "cuda_activities": cuda_events,
+        "conv2d": counts.get("aten::conv2d", 0),
+        "adaptive_pool": counts.get("aten::adaptive_avg_pool2d", 0),
+        "linear": counts.get("aten::linear", 0),
+        "copy_": counts.get("aten::copy_", 0),
+        "reshape": counts.get("aten::reshape", 0),
+        "clone": counts.get("aten::clone", 0),
+        "contiguous": counts.get("aten::contiguous", 0),
+    }
+    print(f"Profiler {label}: " + " ".join(f"{key}={value}" for key, value in summary.items()))
+    return summary
+
+
+def run_o3(args: argparse.Namespace, device: torch.device) -> None:
+    """Profile exact ego-only inference and the rejected numerical candidates."""
+
+    loaded = LiveEgoMotionModel.load(args.checkpoint, device=args.device)
+    model = make_variant(
+        loaded.model,
+        lif_implementation="fused",
+        inference_fast_spike=True,
+        execution_mode="stage_major_chunked",
+        device=device,
+    )
+    event_bins = make_cpu_input(64).to(device)
+    print("Environment")
+    print(f"GPU: {torch.cuda.get_device_name(device)}")
+    print(f"torch: {torch.__version__}")
+    print(f"CUDA: {torch.version.cuda}")
+    print(f"checkpoint: {args.checkpoint.resolve()}")
+    print("input: [1, 64, 2, 96, 128], float32; fixed Poisson count tensor (rate=0.08)")
+
+    model.reset_state()
+    with torch.inference_mode():
+        full_output = model(event_bins)
+    torch.cuda.synchronize(device)
+    if full_output.ego_motion is None:
+        raise RuntimeError("checkpoint does not have an ego-motion head")
+    reference_ego = full_output.ego_motion.mean(dim=1)
+    reference_states = tuple(state.clone() for state in model.membrane_states())
+    primitives = full_output.primitive_spikes
+
+    with torch.inference_mode():
+        loop_pool = torch.stack(
+            [
+                F.adaptive_avg_pool2d(primitives[:, index], (2, 2)).flatten(1)
+                for index in range(primitives.shape[1])
+            ],
+            1,
+        )
+        batch, timesteps = primitives.shape[:2]
+        merged = primitives.reshape(batch * timesteps, *primitives.shape[2:])
+        batch_pool = F.adaptive_avg_pool2d(merged, (2, 2)).flatten(1).reshape(
+            batch, timesteps, -1
+        )
+        loop_head = torch.stack(
+            [model.ego_motion_head(loop_pool[:, index]) for index in range(timesteps)],
+            1,
+        )
+        batch_head = model.ego_motion_head(loop_pool.reshape(batch * timesteps, -1)).reshape(
+            batch, timesteps, 6
+        )
+        mean_before = model.ego_motion_head(loop_pool.mean(1))
+    print("\nHead Micro-Equivalence")
+    for label, expected, actual in (
+        ("O3-B pool", loop_pool, batch_pool),
+        ("O3-C linear sequence", loop_head, batch_head),
+        ("O3-C final mean", reference_ego, batch_head.mean(1)),
+        ("O3-D mean-before-linear", reference_ego, mean_before),
+    ):
+        difference = (expected - actual).abs()
+        print(
+            f"{label}: exact={torch.equal(expected, actual)} "
+            f"max_abs={difference.max().item():.9g} "
+            f"mean_abs={difference.mean().item():.9g} "
+            f"different={int(torch.count_nonzero(difference).item())}"
+        )
+
+    candidates: dict[str, Callable[[], Tensor]] = {
+        "O3-A skip local": lambda: model.forward_ego_motion(
+            event_bins, temporal_pool=False
+        ),
+        "O3-B batch pool": lambda: model.forward_ego_motion(event_bins),
+        "O3-C batch linear": lambda: model.forward_ego_motion(
+            event_bins, temporal_pool=False, temporal_head=True
+        ),
+        "O3-D mean before": lambda: model.forward_ego_motion(
+            event_bins, temporal_pool=False, mean_before_head=True
+        ),
+    }
+    print("\nFull Equivalence")
+    for label, operation in candidates.items():
+        captured_primitives: list[Tensor] = []
+        handle = model.primitive_bottleneck.neurons.register_forward_hook(
+            lambda _module, _inputs, output: captured_primitives.append(output)
+        )
+        model.reset_state()
+        try:
+            with torch.inference_mode():
+                candidate_ego = operation()
+        finally:
+            handle.remove()
+        torch.cuda.synchronize(device)
+        difference = (reference_ego - candidate_ego).abs()
+        candidate_primitives = torch.stack(captured_primitives, 1)
+        states_exact = all(
+            torch.equal(expected, actual)
+            for expected, actual in zip(
+                reference_states, model.membrane_states(), strict=True
+            )
+        )
+        print(
+            f"{label}: ego_exact={torch.equal(reference_ego, candidate_ego)} "
+            f"max_abs={difference.max().item():.9g} "
+            f"mean_abs={difference.mean().item():.9g} "
+            f"primitive_exact={torch.equal(primitives, candidate_primitives)} "
+            f"states_exact={states_exact}"
+        )
+    model.reset_state()
+
+    operations: dict[str, Callable[[], Tensor]] = {
+        "O2 full": lambda: model(event_bins).ego_motion.mean(1),  # type: ignore[union-attr]
+        **candidates,
+    }
+    results: dict[str, dict[str, float]] = {}
+    print("\nO3 Performance (CUDA events)")
+    print(
+        f"{'Variant':<24} {'p50 ms':>10} {'p95 ms':>10} {'mean ms':>10} "
+        f"{'min ms':>10} {'max ms':>10} {'speedup':>10}"
+    )
+    for label, operation in operations.items():
+        results[label] = summarize(
+            operation_samples(
+                model,
+                operation,
+                device,
+                warmup_runs=args.warmup,
+                measured_runs=args.runs,
+            )
+        )
+    baseline = results["O2 full"]["p50"]
+    for label, result in results.items():
+        print(
+            f"{label:<24} {result['p50']:10.3f} {result['p95']:10.3f} "
+            f"{result['mean']:10.3f} {result['min']:10.3f} {result['max']:10.3f} "
+            f"{baseline / result['p50']:9.3f}x"
+        )
+    print("O3-best = O3-B batch pool (exact)")
+
+    for label in ("O2 full", "O3-B batch pool"):
+        absolute, incremental = peak_operation_memory_mb(
+            model, operations[label], device
+        )
+        print(
+            f"Memory {label}: absolute_peak_mb={absolute:.3f} "
+            f"incremental_forward_mb={incremental:.3f}"
+        )
+    profile_operation(
+        "O2 full", model, operations["O2 full"], device, args.profiler_runs
+    )
+    profile_operation(
+        "O3-best", model, operations["O3-B batch pool"], device, args.profiler_runs
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.device != "cuda" or not torch.cuda.is_available():
@@ -483,6 +712,9 @@ def main() -> None:
         raise SystemExit("--warmup >= 1, --runs >= 2, and --profiler-runs >= 1 are required.")
 
     device = torch.device(args.device)
+    if args.experiment == "o3":
+        run_o3(args, device)
+        return
     loaded = LiveEgoMotionModel.load(args.checkpoint, device=args.device)
     reference = loaded.model
     variants = {
