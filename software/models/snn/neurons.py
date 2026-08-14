@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
 from torch import Tensor, nn
@@ -27,6 +28,56 @@ def surrogate_spike(membrane_delta: Tensor, surrogate: str = "atan") -> Tensor:
     if surrogate != "atan":
         raise ValueError(f"unsupported surrogate: {surrogate!r}")
     return _ATanSpike.apply(membrane_delta)
+
+
+def fused_lif_inference_step(
+    synaptic_input: Tensor,
+    previous_membrane: Tensor,
+    alpha: Tensor,
+    threshold: float,
+) -> tuple[Tensor, Tensor]:
+    """Pure, state-free tensor step for the fused inference LIF path."""
+
+    membrane = alpha * previous_membrane + synaptic_input
+    spikes = (membrane - threshold >= 0.0).to(membrane.dtype)
+    return spikes, membrane - threshold * spikes
+
+
+def fused_lif_first_inference_step(
+    synaptic_input: Tensor, threshold: float
+) -> tuple[Tensor, Tensor]:
+    """Pure reset-boundary equivalent of a fused LIF step with zero state."""
+
+    spikes = (synaptic_input - threshold >= 0.0).to(synaptic_input.dtype)
+    return spikes, synaptic_input - threshold * spikes
+
+
+def fused_lif_inference_step_addcmul(
+    synaptic_input: Tensor,
+    previous_membrane: Tensor,
+    alpha: Tensor,
+    threshold: float,
+) -> tuple[Tensor, Tensor]:
+    """Microbenchmark candidate: ``alpha * state + input`` via addcmul."""
+
+    membrane = torch.addcmul(synaptic_input, previous_membrane, alpha)
+    spikes = (membrane - threshold >= 0.0).to(membrane.dtype)
+    return spikes, membrane - threshold * spikes
+
+
+@lru_cache(maxsize=4)
+def compiled_fused_lif_step(mode: str, first_step: bool, primitive: str = "mul_add"):
+    """Compile only a pure LIF tensor function; no module state is captured."""
+
+    if first_step:
+        function = fused_lif_first_inference_step
+    elif primitive == "mul_add":
+        function = fused_lif_inference_step
+    elif primitive == "addcmul":
+        function = fused_lif_inference_step_addcmul
+    else:
+        raise ValueError("lif_step_primitive must be 'mul_add' or 'addcmul'")
+    return torch.compile(function, fullgraph=True, dynamic=False, mode=mode)
 
 
 class LIF(nn.Module):
@@ -179,6 +230,9 @@ class FusedMultiTimescaleLIF(nn.Module):
         fast_ratio: float = 0.5,
         surrogate: str = "atan",
         inference_fast_spike: bool = False,
+        compiled_lif_mode: str = "none",
+        first_step_specialization: bool = False,
+        lif_step_primitive: str = "mul_add",
     ) -> None:
         super().__init__()
         if channels < 2:
@@ -195,6 +249,13 @@ class FusedMultiTimescaleLIF(nn.Module):
         self.threshold = float(threshold)
         self.surrogate = surrogate
         self.inference_fast_spike = inference_fast_spike
+        if compiled_lif_mode not in {"none", "default", "reduce-overhead"}:
+            raise ValueError("compiled_lif_mode must be 'none', 'default', or 'reduce-overhead'")
+        self.compiled_lif_mode = compiled_lif_mode
+        self.first_step_specialization = first_step_specialization
+        if lif_step_primitive not in {"mul_add", "addcmul"}:
+            raise ValueError("lif_step_primitive must be 'mul_add' or 'addcmul'")
+        self.lif_step_primitive = lif_step_primitive
         alpha = torch.tensor(
             [math.exp(-dt_ms / tau_fast_ms)] * self.fast_channels
             + [math.exp(-dt_ms / tau_slow_ms)] * self.slow_channels
@@ -216,7 +277,8 @@ class FusedMultiTimescaleLIF(nn.Module):
         expected_channels = self.fast_channels + self.slow_channels
         if synaptic_input.shape[1] != expected_channels:
             raise ValueError(f"expected {expected_channels} channels, got {synaptic_input.shape[1]}")
-        if self._membrane is None:
+        is_first_step = self._membrane is None
+        if is_first_step:
             previous = torch.zeros_like(synaptic_input)
         else:
             if self._membrane.shape != synaptic_input.shape:
@@ -225,14 +287,30 @@ class FusedMultiTimescaleLIF(nn.Module):
                 )
             previous = self._membrane
 
-        membrane = self.alpha * previous + synaptic_input
-        membrane_delta = membrane - self.threshold
-        spikes = (
-            (membrane_delta >= 0.0).to(membrane.dtype)
-            if self.inference_fast_spike and not torch.is_grad_enabled()
-            else surrogate_spike(membrane_delta, self.surrogate)
-        )
-        self._membrane = membrane - self.threshold * spikes
+        if self.inference_fast_spike and not torch.is_grad_enabled():
+            if self.compiled_lif_mode != "none":
+                if self.first_step_specialization and is_first_step:
+                    spikes, membrane = compiled_fused_lif_step(
+                        self.compiled_lif_mode, first_step=True, primitive=self.lif_step_primitive
+                    )(synaptic_input, self.threshold)
+                else:
+                    spikes, membrane = compiled_fused_lif_step(
+                        self.compiled_lif_mode, first_step=False, primitive=self.lif_step_primitive
+                    )(synaptic_input, previous, self.alpha, self.threshold)
+            elif self.first_step_specialization and is_first_step:
+                spikes, membrane = fused_lif_first_inference_step(synaptic_input, self.threshold)
+            else:
+                step = (
+                    fused_lif_inference_step_addcmul
+                    if self.lif_step_primitive == "addcmul"
+                    else fused_lif_inference_step
+                )
+                spikes, membrane = step(synaptic_input, previous, self.alpha, self.threshold)
+        else:
+            membrane = self.alpha * previous + synaptic_input
+            spikes = surrogate_spike(membrane - self.threshold, self.surrogate)
+            membrane = membrane - self.threshold * spikes
+        self._membrane = membrane
         return spikes
 
     def reset_state(self) -> None:

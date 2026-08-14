@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 
 from software.models.snn import (
     FusedMultiTimescaleLIF,
@@ -91,3 +92,49 @@ def test_fused_reset_and_detach_preserve_state_semantics() -> None:
     assert not fused.membrane_state.requires_grad
     fused.reset_state()
     assert fused.membrane_state is None
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled LIF test requires CUDA")
+def test_compiled_fused_and_first_step_are_t64_bitwise_equivalent() -> None:
+    torch.manual_seed(55)
+    r3 = SNNMotionBackbone(
+        lif_implementation="fused", inference_fast_spike=True
+    ).cuda().eval()
+    r4 = SNNMotionBackbone(
+        lif_implementation="fused",
+        inference_fast_spike=True,
+        compiled_lif_mode="default",
+    ).cuda().eval()
+    r5 = SNNMotionBackbone(
+        lif_implementation="fused",
+        inference_fast_spike=True,
+        compiled_lif_mode="default",
+        first_step_specialization=True,
+    ).cuda().eval()
+    r7 = SNNMotionBackbone(
+        lif_implementation="fused",
+        inference_fast_spike=True,
+        compiled_lif_mode="default",
+        lif_step_primitive="addcmul",
+    ).cuda().eval()
+    r4.load_state_dict(r3.state_dict(), strict=True)
+    r5.load_state_dict(r3.state_dict(), strict=True)
+    r7.load_state_dict(r3.state_dict(), strict=True)
+    event_bins = torch.poisson(
+        torch.full((1, 64, 2, 16, 16), 0.08), generator=torch.Generator().manual_seed(91)
+    ).cuda()
+    with torch.inference_mode():
+        r3.reset_state()
+        expected = r3(event_bins)
+        for candidate in (r4, r5, r7):
+            candidate.reset_state()
+            actual = candidate(event_bins)
+            for name in ("primitive_spikes", "local_logits", "global_embedding", "ego_motion"):
+                assert torch.equal(getattr(expected, name), getattr(actual, name))
+            for expected_state, actual_state in zip(
+                r3.membrane_states(), candidate.membrane_states(), strict=True
+            ):
+                # Inductor may contract mul+add into FMA, changing only ULP-scale
+                # membrane rounding.  The externally visible sequence is exact.
+                assert (expected_state - actual_state).abs().max().item() <= 1e-5

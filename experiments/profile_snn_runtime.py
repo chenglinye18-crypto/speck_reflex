@@ -251,7 +251,8 @@ def profiler_summary(
         f"cat={op_counts.get('aten::cat', 0)} "
         f"split={op_counts.get('aten::split_with_sizes', 0) + op_counts.get('aten::split', 0)} "
         f"mul={op_counts.get('aten::mul', 0)} add={op_counts.get('aten::add', 0)} "
-        f"sub={op_counts.get('aten::sub', 0)} ge={op_counts.get('aten::ge', 0)}"
+        f"sub={op_counts.get('aten::sub', 0)} ge={op_counts.get('aten::ge', 0)} "
+        f"copy_={op_counts.get('aten::copy_', 0)}"
     )
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
     return {
@@ -262,6 +263,7 @@ def profiler_summary(
         "add": op_counts.get("aten::add", 0),
         "sub": op_counts.get("aten::sub", 0),
         "ge": op_counts.get("aten::ge", 0),
+        "copy_": op_counts.get("aten::copy_", 0),
     }
 
 
@@ -289,6 +291,9 @@ def make_variant(
     *,
     lif_implementation: str,
     inference_fast_spike: bool,
+    compiled_lif_mode: str = "none",
+    first_step_specialization: bool = False,
+    lif_step_primitive: str = "mul_add",
     device: torch.device,
 ) -> SNNMotionBackbone:
     """Build a runtime-only variant from exactly the loaded checkpoint state."""
@@ -297,6 +302,9 @@ def make_variant(
         reference.config,
         lif_implementation=lif_implementation,
         inference_fast_spike=inference_fast_spike,
+        compiled_lif_mode=compiled_lif_mode,
+        first_step_specialization=first_step_specialization,
+        lif_step_primitive=lif_step_primitive,
     ).to(device)
     variant.load_state_dict(reference.state_dict(), strict=True)
     variant.eval()
@@ -324,6 +332,36 @@ def main() -> None:
         "R3 fused + fast spike": make_variant(
             reference, lif_implementation="fused", inference_fast_spike=True, device=device
         ),
+        "R4a compiled default": make_variant(
+            reference,
+            lif_implementation="fused",
+            inference_fast_spike=True,
+            compiled_lif_mode="default",
+            device=device,
+        ),
+        "R4b compiled reduce-overhead": make_variant(
+            reference,
+            lif_implementation="fused",
+            inference_fast_spike=True,
+            compiled_lif_mode="reduce-overhead",
+            device=device,
+        ),
+        "R5 R4a + first step": make_variant(
+            reference,
+            lif_implementation="fused",
+            inference_fast_spike=True,
+            compiled_lif_mode="default",
+            first_step_specialization=True,
+            device=device,
+        ),
+        "R7 R4a + addcmul": make_variant(
+            reference,
+            lif_implementation="fused",
+            inference_fast_spike=True,
+            compiled_lif_mode="default",
+            lif_step_primitive="addcmul",
+            device=device,
+        ),
     }
     print("Environment")
     print(f"GPU: {torch.cuda.get_device_name(device)}")
@@ -336,17 +374,39 @@ def main() -> None:
     gpu_input = cpu_input.to(device)
     variant_results: dict[str, dict[str, float]] = {}
     print("\nPerformance (normal forward; CUDA events)")
-    print(f"{'Variant':<28} {'p50 ms':>10} {'p95 ms':>10} {'mean ms':>10} {'speedup':>10}")
+    print(
+        f"{'Variant':<28} {'p50 ms':>10} {'p95 ms':>10} {'mean ms':>10} "
+        f"{'min ms':>10} {'max ms':>10} {'speedup':>10}"
+    )
+    compile_timings: dict[str, float] = {}
+    rejected_variants: dict[str, str] = {}
     for label, model in variants.items():
-        warmup(model, gpu_input, args.warmup, device)
-        samples = normal_forward_samples(model, gpu_input, device, args.runs)
-        variant_results[label] = summarize(samples)
+        try:
+            if label.startswith("R4") or label.startswith("R5") or label.startswith("R7"):
+                torch._dynamo.reset()
+                model.reset_state()
+                started = time.perf_counter()
+                with torch.inference_mode():
+                    model(gpu_input)
+                torch.cuda.synchronize(device)
+                compile_timings[label] = time.perf_counter() - started
+            warmup(model, gpu_input, args.warmup, device)
+            samples = normal_forward_samples(model, gpu_input, device, args.runs)
+            variant_results[label] = summarize(samples)
+        except RuntimeError as error:
+            rejected_variants[label] = str(error).splitlines()[0]
+            torch.cuda.synchronize(device)
     baseline_p50 = variant_results["R0 reference"]["p50"]
     for label, summary in variant_results.items():
         print(
             f"{label:<28} {summary['p50']:10.3f} {summary['p95']:10.3f} "
-            f"{summary['mean']:10.3f} {baseline_p50 / summary['p50']:9.3f}x"
+            f"{summary['mean']:10.3f} {summary['min']:10.3f} {summary['max']:10.3f} "
+            f"{baseline_p50 / summary['p50']:9.3f}x"
         )
+    for label, reason in rejected_variants.items():
+        print(f"{label:<28} REJECTED: {reason}")
+    for label, elapsed_s in compile_timings.items():
+        print(f"{label} first_compile_plus_forward_s={elapsed_s:.3f}")
 
     optimized = variants["R3 fused + fast spike"]
     print("\nT Scaling: R3 fused + fast spike (fixed B=1,C=2,H=96,W=128)")
@@ -357,8 +417,8 @@ def main() -> None:
         samples = normal_forward_samples(optimized, event_bins, device, args.runs)
         summary = summarize(samples)
         print(f"{timesteps:4d} {summary['p50']:16.3f} {summary['p95']:16.3f} {summary['p50'] / timesteps:18.3f}")
-    profiler_summary("R0 reference", reference, gpu_input, device, args.profiler_runs)
     profiler_summary("R3 fused + fast spike", optimized, gpu_input, device, args.profiler_runs)
+    profiler_summary("R4a compiled default", variants["R4a compiled default"], gpu_input, device, args.profiler_runs)
 
 
 if __name__ == "__main__":

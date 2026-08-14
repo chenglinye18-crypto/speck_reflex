@@ -83,6 +83,9 @@ class SNNMotionBackbone(nn.Module):
         *,
         lif_implementation: str = "reference",
         inference_fast_spike: bool = False,
+        compiled_lif_mode: str = "none",
+        first_step_specialization: bool = False,
+        lif_step_primitive: str = "mul_add",
     ) -> None:
         super().__init__()
         self.config = config or SNNMotionConfig()
@@ -90,6 +93,9 @@ class SNNMotionBackbone(nn.Module):
             raise ValueError("lif_implementation must be 'reference' or 'fused'")
         self.lif_implementation = lif_implementation
         self.inference_fast_spike = inference_fast_spike
+        self.compiled_lif_mode = compiled_lif_mode
+        self.first_step_specialization = first_step_specialization
+        self.lif_step_primitive = lif_step_primitive
 
         stage_inputs = (self.config.input_channels, *self.config.channels[:-1])
         self.stages = nn.ModuleList(
@@ -143,6 +149,9 @@ class SNNMotionBackbone(nn.Module):
             surrogate=self.config.surrogate,
             lif_implementation=self.lif_implementation,
             inference_fast_spike=self.inference_fast_spike,
+            compiled_lif_mode=self.compiled_lif_mode,
+            first_step_specialization=self.first_step_specialization,
+            lif_step_primitive=self.lif_step_primitive,
         )
 
     def forward(self, event_bins: Tensor) -> SNNMotionOutput:

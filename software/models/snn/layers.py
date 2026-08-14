@@ -26,6 +26,9 @@ class ConvLIFBlock(nn.Module):
         surrogate: str,
         lif_implementation: str = "reference",
         inference_fast_spike: bool = False,
+        compiled_lif_mode: str = "none",
+        first_step_specialization: bool = False,
+        lif_step_primitive: str = "mul_add",
     ) -> None:
         super().__init__()
         self.conv = nn.Conv2d(
@@ -42,8 +45,7 @@ class ConvLIFBlock(nn.Module):
         }.get(lif_implementation)
         if lif_class is None:
             raise ValueError("lif_implementation must be 'reference' or 'fused'")
-        self.neurons = lif_class(
-            out_channels,
+        lif_kwargs = dict(
             tau_fast_ms=tau_fast_ms,
             tau_slow_ms=tau_slow_ms,
             dt_ms=dt_ms,
@@ -52,6 +54,11 @@ class ConvLIFBlock(nn.Module):
             surrogate=surrogate,
             inference_fast_spike=inference_fast_spike,
         )
+        if lif_implementation == "fused":
+            lif_kwargs["compiled_lif_mode"] = compiled_lif_mode
+            lif_kwargs["first_step_specialization"] = first_step_specialization
+            lif_kwargs["lif_step_primitive"] = lif_step_primitive
+        self.neurons = lif_class(out_channels, **lif_kwargs)
 
     def forward(self, spikes: Tensor) -> Tensor:
         return self.neurons(self.conv(spikes))
