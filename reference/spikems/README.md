@@ -113,3 +113,5 @@ upstream README 中的测试命令和参数仍以 `third_party/SpikeMS/README.md
 ## Reproduction attempts
 
 - [2026-08-15：官方数据入口失效，Data Gate FAIL](REPRODUCTION_20260815.md)
+- [2026-08-15：官方 model forward 与单样本 EVIMO2 adapter 验证](VALIDATION_20260815.md)
+- [当前 compatibility environment 说明](ENVIRONMENT.md)
