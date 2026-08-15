@@ -109,3 +109,7 @@ EVIMO loader 在测试数据路径中使用 ground-truth mask 做了两项处理
 7. 最后增加无真值 crop/filter 对照；一次只改变这一项。
 
 upstream README 中的测试命令和参数仍以 `third_party/SpikeMS/README.md` 为准。
+
+## Reproduction attempts
+
+- [2026-08-15：官方数据入口失效，Data Gate FAIL](REPRODUCTION_20260815.md)
