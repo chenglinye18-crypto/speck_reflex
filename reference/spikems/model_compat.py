@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import types
@@ -46,6 +47,11 @@ def load_official_slayer_cuda(source_root: Path, build_root: Path) -> Any:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required by the official SLAYER forward path")
     capability = torch.cuda.get_device_capability(0)
+    # Directly invoking a virtualenv's Python does not prepend its bin directory
+    # to PATH. torch's extension loader discovers ninja through PATH.
+    environment_bin = Path(sys.executable).parent
+    if shutil.which("ninja") is None and (environment_bin / "ninja").is_file():
+        os.environ["PATH"] = f"{environment_bin}:{os.environ.get('PATH', '')}"
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{capability[0]}.{capability[1]}")
     os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(build_root.resolve()))
     module = load(

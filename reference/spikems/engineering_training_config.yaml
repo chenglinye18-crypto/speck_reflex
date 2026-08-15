@@ -1,0 +1,68 @@
+baseline_marker: SPIKEMS_LSPIKE_ENGINEERING_BASELINE
+
+camera:
+  value: right_camera
+  provenance: ENGINEERING_CHOICE
+
+input:
+  layout: B,2,H,W,T
+  channel_0: negative/OFF
+  channel_1: positive/ON
+  provenance: EVIMO2_RIGHT_CAMERA_REQUIREMENT
+
+temporal:
+  physical_window_ms:
+    value: 10.0
+    provenance: SPIKEMS_PAPER
+  timestep_ms:
+    value: 1.0
+    provenance: SPIKEMS_PAPER
+  num_time_bins:
+    value: 10
+    provenance: SPIKEMS_PAPER
+  checkpoint_kernel_build_tSample:
+    value: 100
+    provenance: SPIKEMS_CHECKPOINT_CONFIG_COMPATIBILITY
+    note: Registered SRM/refactory buffers are strict-loaded at their checkpoint shapes; actual input T is 10.
+
+gt:
+  definition: input_spikes AND moving_object_mask
+  provenance: SPIKEMS_PAPER_AND_RELEASED_CODE
+
+model:
+  architecture: unetRNN6Layer_noBlock
+  provenance: SPIKEMS_RELEASED_CODE
+  initialization: official_EV-IMO_pretrained_checkpoint
+  initialization_provenance: ENGINEERING_CHOICE
+
+loss:
+  function: slayerpytorch.loss.spikeTime
+  reduction: official_sum
+  normalization: none
+  provenance: SPIKEMS_RELEASED_CODE
+
+optimizer:
+  name: Adam
+  learning_rate: 0.0001
+  betas: [0.9, 0.999]
+  eps: 0.00000001
+  weight_decay: 0.0
+  amsgrad: true
+  state: fresh
+  provenance: SPIKEMS_CHECKPOINT
+
+batch_size:
+  value: 1
+  provenance: DEBUG_RESOURCE_CHOICE
+
+spatial:
+  initial_strategy: full_frame
+  gt_alignment: top_left_crop_to_prediction_support
+  interpolation: none
+  provenance: RELEASED_RUNNER_AND_DEBUG_RESOURCE_CHOICE
+
+training:
+  augmentation: none
+  sample_count: 8
+  formal_training: forbidden
+  provenance: ENGINEERING_DEBUG_CHOICE
