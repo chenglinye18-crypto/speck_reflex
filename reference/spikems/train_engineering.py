@@ -164,6 +164,19 @@ def gradient_statistics(parameters: Iterable[torch.nn.Parameter]) -> dict[str, i
     }
 
 
+def named_gradient_norms(model) -> dict[str, float | None]:
+    """Return one diagnostic norm for each of SpikeMS's six trainable layers."""
+
+    result = {}
+    for name, parameter in model.named_parameters():
+        result[name] = (
+            float(torch.linalg.vector_norm(parameter.grad.detach().float()).item())
+            if parameter.grad is not None
+            else None
+        )
+    return result
+
+
 def clone_trainable_parameters(model) -> list[torch.Tensor]:
     return [parameter.detach().clone() for parameter in model.parameters()]
 
