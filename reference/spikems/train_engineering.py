@@ -50,13 +50,9 @@ def build_training_components(
 ):
     """Build the released model/loss and a fresh optimizer with checkpoint hyperparameters."""
 
-    # The checkpoint state dict includes registered SRM/refractory kernels built
-    # with tSample=100. Strict-load those buffers unchanged. Runtime duration is
-    # still the input tensor's final dimension (T=10).
-    model, checkpoint, load_result = build_official_model(
+    model, optimizer, checkpoint, load_result = build_model_and_optimizer(
         spikems_root, checkpoint_path, device
     )
-    model.train()
     snn = importlib.import_module("slayerpytorch")
     criterion = snn.loss(
         {
@@ -64,6 +60,23 @@ def build_training_components(
             "neuron": dict(GLOBAL_NEURON),
         }
     ).to(device)
+    return model, criterion, optimizer, checkpoint, load_result
+
+
+def build_model_and_optimizer(
+    spikems_root: Path,
+    checkpoint_path: Path,
+    device: torch.device,
+):
+    """Build official checkpoint weights and a fresh checkpoint-configured Adam."""
+
+    # The checkpoint state dict includes registered SRM/refractory kernels built
+    # with tSample=100. Strict-load those buffers unchanged. Runtime duration is
+    # still the input tensor's final dimension (T=10).
+    model, checkpoint, load_result = build_official_model(
+        spikems_root, checkpoint_path, device
+    )
+    model.train()
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=1e-4,
@@ -72,7 +85,7 @@ def build_training_components(
         weight_decay=0.0,
         amsgrad=True,
     )
-    return model, criterion, optimizer, checkpoint, load_result
+    return model, optimizer, checkpoint, load_result
 
 
 def align_gt_to_prediction(gt: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
