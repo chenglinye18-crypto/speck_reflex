@@ -1,125 +1,60 @@
-# Robot Neuromorphic Reflex Arc Co-design Platform
+# speck_reflex
 
-An independent research platform for co-designing low-latency, low-power robot reflex paths across software models, event sensors, embedded processors, FPGA accelerators, neuromorphic chips, communication protocols, and a deterministic Safety MCU.
+本仓库当前只研究一个问题：
 
-This is not an SNN-only project, a Speck SDK project, or an official SynSense repository. Speck is one evaluated backend candidate. The long-term platform may support PyTorch simulation, STM32N6 prototypes, FPGA accelerators, SynSense Speck, and other neuromorphic hardware.
+> 在 Event Camera 自身运动时，仅使用 DVS events，SNN 能否把 camera ego-motion
+> 产生的背景事件与 independent moving object 产生的事件分离？
 
-## Why robots need a digital reflex arc
+第一参考基线固定为
+[SpikeMS: Deep Spiking Neural Network for Motion Segmentation](https://github.com/prgumd/SpikeMS)。
+本阶段不设计新 SNN，不优化网络，也不讨论 TTC、risk、reflex decision 或硬件部署。
 
-A robot's main cognition stack—Jetson, ROS 2, semantic vision, planning, and large learned models—provides rich understanding but can have variable latency, high power demand, and broad failure modes. A reflex path should detect sudden intrusion, rapid approach, collision risk, and abnormal motion through a small, event-driven path that remains available when the cognition computer is busy or offline.
-
-The reflex path does not replace cognition or certified safety logic. It produces bounded advisory risk evidence for a separate Safety MCU, which performs final deterministic arbitration.
-
-## System architecture
-
-```text
-Main cognition path
-RGB / depth / other sensors
-        |
-Jetson + ROS 2 + semantic models + planning
-        |
-        +------------------------------+
-                                       v
-Event Camera / DVS              Safety MCU              Motor Controller
-        |                    final deterministic  ----> braking / speed limits
-Event Processing                   arbitration
-        |                              ^
-Neuromorphic Processor               |
-SNN / FPGA / future ASIC             |
-        |                              |
-Risk Estimation ----------------------+
-
-Fast reflex path: low latency, low power, independent of main cognition.
-```
-
-Jetson owns semantic recognition, identity/attributes, confirmed fall understanding, scene reasoning, and planning. The neuromorphic path targets fast motion risk. The Safety MCU combines reflex output with watchdogs, motion state, current/braking limits, and other safety inputs. No model or accelerator directly controls motor PWM.
-
-## Software–hardware co-design
-
-Four versioned boundaries prevent algorithms from being tied to one chip:
-
-1. **Event Input Interface** — canonical `(x, y, timestamp_us, polarity)` events and bounded `EventWindow` objects.
-2. **Reflex Model Interface** — any ANN, SNN, or hybrid model maps an event window to risk, TTC, direction, emergency-stop request, and timestamp.
-3. **Reflex Output Interface** — a fixed-point, CRC-protected advisory message to the Safety MCU.
-4. **Hardware Backend Interface** — lifecycle and data-plane operations shared by simulation adapters, STM32N6, FPGA, Speck, and future targets.
-
-Canonical Python contracts live in `software/` and `hardware/interfaces/`. Wire contracts live in `protocols/`. Vendor types must stop at backend adapters.
-
-See the detailed [platform architecture](docs/architecture.md) and frozen [reflex output protocol](protocols/reflex_protocol.md).
-
-## Current implementation status
-
-| Layer | Status |
-|---|---|
-| Canonical event/model/backend interfaces | Implemented and unit-tested |
-| Protocol v1 semantic and binary layouts | Documented; transport not implemented |
-| PyTorch/Sinabs software baseline | Existing official N-MNIST baseline retained |
-| Specksim and offline Speck configuration | Existing no-hardware baseline retained |
-| STM32N6 firmware/backend | Planned; no driver or hardware connection |
-| FPGA accelerator/RTL/HLS | Planned; no implementation |
-| Physical Speck/on-chip DVS | Not validated; no board connected |
-| Robot collision/TTC model and dataset | Not implemented |
-| Safety certification | Not provided |
-
-The retained N-MNIST experiment is a backend/toolchain reference, not a robot reflex model. Its host-injected 34×34 events must not be described as the on-chip DVS path.
-
-## Repository map
+## 当前研究边界
 
 ```text
-software/                hardware-neutral event, model and simulation contracts
-  event_processing/      canonical format and adapter/filter interfaces
-  models/                ANN / SNN / hybrid model workspaces
-  training/ evaluation/  future reproducible pipelines and metrics
-hardware/                backend abstraction and hardware-specific plans
-  stm32n6/ fpga/ speck/  independent optional backends
-  sensors/               DVS and future event-source boundaries
-datasets/                manifests only; raw data stays outside Git
-protocols/               versioned event, reflex, MCU and ROS 2 contracts
-experiments/              collision, TTC, benchmark and retained official baselines
-src/speck_reflex/         compatibility package for validated existing baselines
-third_party/              pinned, unmodified upstream source
-docs/                     architecture, hardware decisions and roadmap
+Raw DVS
+  -> Event Representation
+  -> SpikeMS motion-segmentation SNN
+  -> ego-motion background / independent motion
 ```
 
-## Hardware roadmap
+下一阶段问题只有在这一层得到可信验证后才进入仓库。
 
-- **STM32N6:** fastest route to embedded timing, communications, watchdog, and MCU integration experiments; useful prototype but not inherently neuromorphic.
-- **FPGA:** validates event scheduling, spike routing, LIF neurons, synapse memory, accumulation, and thresholds with measurable cycle/power behavior; longer development cycle.
-- **Neuromorphic chips:** intended low-power event-driven direction, including Speck and future devices; availability, SDK constraints, routing, memory, readout, and reproducibility must be evaluated per backend.
+## 仓库结构
 
-See [hardware selection](docs/hardware_selection.md) and the [FPGA design plan](docs/fpga_design.md).
-The staged implementation sequence and exit criteria are in the [roadmap](docs/roadmap.md).
+```text
+AGENTS.md                  对研究与开发工作的约束
+RESEARCH_PRINCIPLES.md     当前科学问题、实验顺序和退出条件
+third_party/SpikeMS/       固定版本的 GPL-3.0 upstream submodule；禁止修改
+reference/spikems/         我们自己的复现记录、审计和后续适配说明
+scripts/                   不修改 upstream 的辅助检查脚本
+```
 
-## Research benchmark
+历史上的 Speck / Sinabs / Samna、N-MNIST、STM32N6、FPGA、hardware
+backend、MCU/reflex protocol、旧 ANN/hybrid/自建 SNN、ego-motion head、synthetic
+motion 以及 TTC/risk/collision pipeline 已退出 main 工作树。需要追溯时使用 Git history，
+不要把它们复制回 `legacy/` 或 `archive/`。
 
-Backends will receive identical canonical event windows and produce the same reflex schema. Comparisons must report:
-
-- task metrics: missed-risk, false-stop, directional accuracy, TTC error;
-- timing: sensor-to-output p50/p95/p99 latency and jitter;
-- capacity: sustained event rate, queue depth, event loss, overload recovery;
-- efficiency: idle/active power and energy per event/window;
-- equivalence: software/quantized/FPGA/neuromorphic output disagreement;
-- resilience: cognition-host loss, stale data, corrupted frames, sensor/backend reset.
-
-No benchmark claim is valid unless its dataset provenance, clock boundary, backend version, configuration, seed, and raw results are recorded.
-
-## Existing reproducible baseline
-
-The official Sinabs v3.1.3 N-MNIST work remains available as a compatibility baseline:
+## 获取固定的 SpikeMS reference
 
 ```bash
+git clone --recurse-submodules <this-repository-url>
+cd speck_reflex
 git submodule update --init --recursive
-source scripts/activate.sh
-make doctor
-make test-fast
-make demo-smoke    # deterministic random weights; PIPELINE_SMOKE_ONLY
-make demo-nmnist   # licensed official NIR checkpoint; functional demo
+bash scripts/verify_spikems_reference.sh
 ```
 
-New machines should first run the read-only `bash scripts/bootstrap_wsl_cuda.sh`; `.venv` is never assumed to exist. See the [demo guide](docs/DEMO_GUIDE.md).
+当前固定的 SpikeMS commit：
+`c449c83313423d62a23d92df32dd8d3180680a36`。
 
-## Safety and licensing
+运行 upstream 前请先阅读
+[`reference/spikems/README.md`](reference/spikems/README.md)。原项目依赖较老的 Python、
+PyTorch 和 CUDA 软件栈；本仓库当前没有宣称它已经在现代环境中复现成功。
 
-This research platform is not certified for collision avoidance, emergency braking, medical fall detection, or any safety-critical function. Reflex predictions are advisory, heartbeat and CRC are necessary but insufficient, and the Safety MCU must fail safely on timeout, corruption, disagreement, or backend loss.
+## 研究状态
 
-Third-party code retains its own license. The main repository license is still pending owner selection; see [licensing](docs/LICENSING.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
+- 已完成：仓库主线清理；SpikeMS upstream 固定与静态审计。
+- 尚未完成：原始预训练推理复现、EVIMO2 数据协议确认、三种基础实验。
+- 当前禁止：在 baseline 成立前同时更换数据、event representation、网络或 loss。
+
+清理前的仓库状态由 tag `pre-spikems-reset-20260815` 保存；没有改写 Git history。
