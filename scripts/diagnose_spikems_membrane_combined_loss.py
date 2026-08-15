@@ -120,12 +120,18 @@ def event_metrics(prediction, gt, spatial_foreground_mask) -> dict:
     pred_count = int(pred_binary.sum().item())
     outside = ~spatial_foreground_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
     leaked = int(torch.logical_and(pred_binary, outside).sum().item())
+    prediction_by_timestep = pred_binary.sum(dim=(0, 1, 2, 3)).tolist()
+    gt_by_timestep = gt_binary.sum(dim=(0, 1, 2, 3)).tolist()
     return {
         "event_iou": intersection / union if union else 0.0,
         "event_precision": intersection / pred_count if pred_count else 0.0,
         "event_recall": intersection / gt_count if gt_count else 0.0,
         "background_leakage": leaked / pred_count if pred_count else 0.0,
         "prediction_spikes": pred_count,
+        "prediction_spikes_by_timestep": [
+            int(value) for value in prediction_by_timestep
+        ],
+        "gt_spikes_by_timestep": [int(value) for value in gt_by_timestep],
     }
 
 
