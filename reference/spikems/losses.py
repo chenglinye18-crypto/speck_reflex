@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 
 RECONSTRUCTED_SPATIAL_BCE_V1 = "RECONSTRUCTED_SPATIAL_BCE_V1"
+MEMBRANE_SPATIAL_BCE_V2 = "MEMBRANE_SPATIAL_BCE_V2"
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,70 @@ class SpatialBCEResult:
     num_positive: int
     num_negative: int
     positive_weight: float
+
+
+@dataclass(frozen=True)
+class MembraneSpatialBCEResult:
+    loss: torch.Tensor
+    gt_spatial: torch.Tensor
+    membrane_max: torch.Tensor
+    spatial_logit: torch.Tensor
+    probability: torch.Tensor
+    num_positive: int
+    num_negative: int
+    positive_weight: float
+
+
+def membrane_spatial_bce_v2(
+    final_membrane: torch.Tensor,
+    gt_foreground_events: torch.Tensor,
+    positive_weight: float,
+    theta: float = 0.22,
+) -> MembraneSpatialBCEResult:
+    """Engineering spatial BCE on the continuous final decoder membrane.
+
+    The target is event-derived: a pixel is positive if either polarity has a
+    foreground event at any point in the sample window. The matching prediction
+    logit is max(final_membrane over polarity and time) minus the final-layer
+    firing threshold. This is an engineering interface, not the unpublished
+    SpikeMS spatial BCE.
+    """
+
+    if final_membrane.shape != gt_foreground_events.shape:
+        raise ValueError(
+            f"Membrane {final_membrane.shape} and GT "
+            f"{gt_foreground_events.shape} must match"
+        )
+    if final_membrane.ndim != 5 or final_membrane.shape[1] != 2:
+        raise ValueError("Expected [B,2,H,W,T] SpikeMS tensors")
+    if not positive_weight > 0:
+        raise ValueError("positive_weight must be positive")
+
+    gt_spatial = torch.any(gt_foreground_events > 0, dim=(1, 4)).to(
+        final_membrane.dtype
+    )
+    membrane_max = torch.amax(final_membrane, dim=(1, 4))
+    spatial_logit = membrane_max - theta
+    pos_weight = torch.as_tensor(
+        positive_weight, dtype=spatial_logit.dtype, device=spatial_logit.device
+    )
+    loss = F.binary_cross_entropy_with_logits(
+        spatial_logit, gt_spatial, pos_weight=pos_weight, reduction="mean"
+    )
+    num_positive = int(torch.count_nonzero(gt_spatial).item())
+    num_negative = int(gt_spatial.numel() - num_positive)
+    if num_positive == 0:
+        raise ValueError("Membrane spatial BCE requires positive GT pixels")
+    return MembraneSpatialBCEResult(
+        loss=loss,
+        gt_spatial=gt_spatial,
+        membrane_max=membrane_max,
+        spatial_logit=spatial_logit,
+        probability=torch.sigmoid(spatial_logit),
+        num_positive=num_positive,
+        num_negative=num_negative,
+        positive_weight=float(positive_weight),
+    )
 
 
 def reconstructed_spatial_bce_v1(
